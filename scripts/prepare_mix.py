@@ -7,23 +7,17 @@ as calculator calls (`<<expr=result>>result`), and writes uint16 token files.
 
   python scripts/prepare_mix.py --out data/tinymix --total_tokens 1e9
 
-Default Sources (100% Textbooks, Code & Step-by-Step Reasoning; NO raw web scrape):
-  tiny_codes           nampdn-ai/tiny-codes                  Code + control-flow reasoning snippets   24%
-  tiny_math_textbooks  nampdn-ai/tiny-math-textbooks         Synthetic math & logic textbooks         20%
-  tiny_textbooks       nampdn-ai/tiny-textbooks              Foundational synthetic textbooks         14%
-  tiny_code_textbooks  nampdn-ai/tiny-code-textbooks         Step-by-step code explanation textbooks  12%
-  metamath             meta-math/MetaMathQA                  Math CoT Q&A (with <<a*b=c>> calc tags)  12%
-  tiny_orca_textbooks  nampdn-ai/tiny-orca-textbooks         Step-by-step reasoning textbooks         10%
-  magicoder            ise-uiuc/Magicoder-OSS-Instruct-75K   Algorithmic & coding problem solutions    4%
-  tiny_lessons         nampdn-ai/tiny-lessons                Structured Markdown conceptual lessons    2%
-  gsm8k                openai/gsm8k (main, TRAIN split only) Grade-school math with <<a*b=c>> calls    2%
-
-Optional extra source (enable via --shares):
-  tiny_strange_textbooks  nampdn-ai/tiny-strange-textbooks   Diverse niche synthetic textbooks         0%
-
-Resumable across Colab disconnects / accounts:
-  Pass `--cache_dir /content/drive/MyDrive/retnet-300m/data/tinymix_shards` to
-  checkpoint each source shard as soon as it finishes tokenizing.
+Authentication & Automatic Fallback for Gated `nampdn-ai/tiny-*` Datasets:
+  - The `nampdn-ai/tiny-*` repositories on Hugging Face are marked `gated=auto`,
+    meaning Hugging Face requires you to click "Agree" on their repo pages and
+    provide a Read token (`HF_TOKEN` env var, `--hf_token`, or `.hf_token` file
+    in your Shared Google Drive folder).
+  - If no `HF_TOKEN` is provided (or if a specific `nampdn-ai` dataset has not
+    been accepted on your HF account yet), `prepare_mix.py` automatically falls
+    back to an open, ungated (`gated=False`) textbook/coding/reasoning dataset
+    (`HuggingFaceTB/cosmopedia-100k`, `HuggingFaceTB/finemath` 4+,
+    `ise-uiuc/Magicoder-Evol-Instruct-110K`, `deepmind/code_contests`,
+    `sahil2801/CodeAlpaca-20k`) unless `--strict_gated` is passed.
 """
 
 from __future__ import annotations
@@ -43,6 +37,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from retnet.calculator import annotate_arithmetic  # noqa: E402
 
 EOS = "<|endoftext|>"
+CC_CPP, CC_PY3 = 2, 3  # deepmind/code_contests language ids
 
 
 def _calc(text: str) -> str:
@@ -51,13 +46,7 @@ def _calc(text: str) -> str:
 
 
 def _extract_textbook(r: dict, annotate_math: bool = False) -> list[str]:
-    """Extract textbook content from any `nampdn-ai/tiny-*` row schema.
-
-    In `nampdn-ai/tiny-textbooks`, `r["textbook"]` holds the full synthesized
-    textbook while `r["text"]` is the shorter seed snippet. In other subsets
-    (`tiny-math-textbooks`, `tiny-code-textbooks`, `tiny-orca-textbooks`,
-    `tiny-lessons`), the primary column is `text` or `textbook`.
-    """
+    """Extract textbook content from any `nampdn-ai/tiny-*` or `cosmopedia` row schema."""
     tb = r.get("textbook")
     txt = r.get("text") or r.get("content") or r.get("lesson")
     chosen = None
@@ -72,8 +61,11 @@ def _extract_textbook(r: dict, annotate_math: bool = False) -> list[str]:
 
 
 def _extract_tiny_codes(r: dict) -> list[str]:
-    """Format `nampdn-ai/tiny-codes` rows (`prompt` + `response` + optional language)."""
-    prompt = (r.get("prompt") or r.get("question") or r.get("instruction") or "").strip()
+    """Format `nampdn-ai/tiny-codes` or `Magicoder-Evol` / `CodeAlpaca` rows."""
+    prompt = (r.get("prompt") or r.get("instruction") or r.get("question") or "").strip()
+    inp = (r.get("input") or "").strip()
+    if prompt and inp:
+        prompt = f"{prompt}\nInput: {inp}"
     response = (r.get("response") or r.get("code") or r.get("solution") or r.get("output") or "").strip()
     lang = (r.get("programming_language") or r.get("language") or r.get("lang") or "").strip()
     if prompt and response:
@@ -83,8 +75,8 @@ def _extract_tiny_codes(r: dict) -> list[str]:
 
 
 def _extract_magicoder(r: dict) -> list[str]:
-    prob = (r.get("problem") or "").strip()
-    sol = (r.get("solution") or "").strip()
+    prob = (r.get("problem") or r.get("instruction") or "").strip()
+    sol = (r.get("solution") or r.get("response") or "").strip()
     if not prob or not sol:
         return []
     lang = (r.get("lang") or "").strip()
@@ -92,7 +84,31 @@ def _extract_magicoder(r: dict) -> list[str]:
     return [f"Problem:\n{prob}\n\n{header}\n{sol}"]
 
 
-# name: (hf path, config, split, formatter -> list of texts, default share)
+def _extract_code_contests(r: dict, per_problem: int = 2) -> list[str]:
+    desc = (r.get("description") or "").strip()
+    sols_dict = r.get("solutions") or {}
+    langs = sols_dict.get("language") or []
+    codes = sols_dict.get("solution") or []
+    if not desc or not codes:
+        return []
+    out: list[str] = []
+    py_cnt = cpp_cnt = 0
+    for lid, code in zip(langs, codes):
+        code = code.strip()
+        if not code:
+            continue
+        if lid == CC_PY3 and py_cnt < per_problem:
+            out.append(f"Problem:\n{desc}\n\nSolution (Python):\n{code}")
+            py_cnt += 1
+        elif lid == CC_CPP and cpp_cnt < per_problem:
+            out.append(f"Problem:\n{desc}\n\nSolution (C++):\n{code}")
+            cpp_cnt += 1
+        if py_cnt >= per_problem and cpp_cnt >= per_problem:
+            break
+    return out
+
+
+# Primary sources: (hf_path, config, split, formatter, default_share)
 SOURCES = {
     "tiny_codes": (
         "nampdn-ai/tiny-codes",
@@ -157,7 +173,6 @@ SOURCES = {
         lambda r: [f"Question: {r['question'].strip()}\nAnswer: {r['answer'].strip()}"],
         0.02,
     ),
-    # Optional extra source from nampdn-ai/tiny-series (0.0 by default; enable via --shares)
     "tiny_strange_textbooks": (
         "nampdn-ai/tiny-strange-textbooks",
         None,
@@ -167,23 +182,145 @@ SOURCES = {
     ),
 }
 
+# Ungated (gated=False) high-quality textbook/code/reasoning fallbacks used automatically
+# if a gated `nampdn-ai/tiny-*` repo is accessed without an authorized HF_TOKEN:
+UNGATED_FALLBACKS = {
+    "tiny_codes": (
+        "ise-uiuc/Magicoder-Evol-Instruct-110K",
+        None,
+        "train",
+        _extract_tiny_codes,
+    ),
+    "tiny_math_textbooks": (
+        "HuggingFaceTB/finemath",
+        "finemath-4plus",
+        "train",
+        lambda r: _extract_textbook(r, annotate_math=True),
+    ),
+    "tiny_textbooks": (
+        "HuggingFaceTB/cosmopedia-100k",
+        None,
+        "train",
+        lambda r: _extract_textbook(r, annotate_math=False),
+    ),
+    "tiny_code_textbooks": (
+        "deepmind/code_contests",
+        None,
+        "train",
+        _extract_code_contests,
+    ),
+    "tiny_orca_textbooks": (
+        "HuggingFaceTB/cosmopedia-100k",
+        None,
+        "train",
+        lambda r: _extract_textbook(r, annotate_math=True),
+    ),
+    "tiny_lessons": (
+        "sahil2801/CodeAlpaca-20k",
+        None,
+        "train",
+        _extract_tiny_codes,
+    ),
+    "tiny_strange_textbooks": (
+        "HuggingFaceTB/cosmopedia-100k",
+        None,
+        "train",
+        lambda r: _extract_textbook(r, annotate_math=False),
+    ),
+}
 
-def stream(name: str, hf_token: str | None = None):
+
+def resolve_hf_token(explicit_token: str | None = None, cache_dir: Path | None = None) -> str | None:
+    """Find a Hugging Face token from CLI flag, environment, Shared Drive `.hf_token`,
+    or standard local Hugging Face cache. Returns `None` (never `True`) when absent."""
+    if explicit_token and explicit_token.strip():
+        return explicit_token.strip()
+    for env_key in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"):
+        val = os.environ.get(env_key, "").strip()
+        if val:
+            return val
+    # Check Shared Drive `.hf_token` in cache_dir or its parent folders
+    if cache_dir is not None:
+        for d in (cache_dir, cache_dir.parent, cache_dir.parent.parent):
+            tf = d / ".hf_token"
+            if tf.is_file():
+                try:
+                    t = tf.read_text().strip()
+                    if t:
+                        return t
+                except OSError:
+                    pass
+    for std_p in (
+        Path.home() / ".cache" / "huggingface" / "token",
+        Path.home() / ".huggingface" / "token",
+    ):
+        if std_p.is_file():
+            try:
+                t = std_p.read_text().strip()
+                if t:
+                    return t
+            except OSError:
+                pass
+    return None
+
+
+_WARNED_FALLBACKS: set[str] = set()
+
+
+def _open_hf_stream(path: str, config: str | None, split: str, token: str | None):
     from datasets import load_dataset
 
-    path, config, split, fmt, _ = SOURCES[name]
-    token = hf_token or os.environ.get("HF_TOKEN") or True
+    kw = {"split": split, "streaming": True}
+    if token:
+        kw["token"] = token
     try:
-        ds = load_dataset(path, config, split=split, streaming=True, token=token)
+        ds = load_dataset(path, config, **kw)
     except TypeError:
-        ds = load_dataset(path, config, split=split, streaming=True)
+        kw.pop("token", None)
+        if token:
+            kw["use_auth_token"] = token
+        ds = load_dataset(path, config, **kw)
+    # Peek first element to force authentication/gated check immediately
+    it = iter(ds)
+    first = next(it)
+    return first, it
+
+
+def stream(name: str, hf_token: str | None = None, strict_gated: bool = False):
+    path, config, split, fmt, _ = SOURCES[name]
+    try:
+        first, it = _open_hf_stream(path, config, split, hf_token)
     except Exception as e:
-        raise SystemExit(
-            f"error: could not open {path} ({config}): {e!r}\n"
-            "If this dataset is gated on Hugging Face, accept its terms on huggingface.co "
-            "and set HF_TOKEN (or pass --hf_token)."
-        )
-    for row in ds:
+        if not strict_gated and name in UNGATED_FALLBACKS:
+            fb_path, fb_cfg, fb_split, fb_fmt = UNGATED_FALLBACKS[name]
+            if name not in _WARNED_FALLBACKS:
+                _WARNED_FALLBACKS.add(name)
+                print(
+                    f"  [note] {path} is gated on Hugging Face ({type(e).__name__}); "
+                    f"automatically using ungated textbook/code dataset '{fb_path}'"
+                    + (f" ({fb_cfg})" if fb_cfg else "")
+                    + ".\n         (To use nampdn-ai directly: accept terms at "
+                    f"https://huggingface.co/datasets/{path} and set HF_TOKEN.)",
+                    flush=True,
+                )
+            try:
+                first, it = _open_hf_stream(fb_path, fb_cfg, fb_split, hf_token)
+                fmt = fb_fmt
+            except Exception as e2:
+                raise SystemExit(
+                    f"error: could not open {path} or fallback {fb_path}: {e2!r}"
+                ) from e2
+        else:
+            raise SystemExit(
+                f"error: could not open {path} ({config}): {e!r}\n"
+                f"Accept dataset terms at https://huggingface.co/datasets/{path} and pass --hf_token (or set HF_TOKEN)."
+            ) from e
+
+    for text in fmt(first):
+        text = text.strip()
+        if text:
+            yield text
+    for row in it:
         for text in fmt(row):
             text = text.strip()
             if text:
@@ -289,11 +426,20 @@ def main() -> None:
     ap.add_argument("--total_tokens", type=float, default=1e9)
     ap.add_argument("--val_tokens_per_source", type=float, default=1e6)
     ap.add_argument("--vocab_size", type=int, default=32000)
-    ap.add_argument("--tok_sample_docs", type=int, default=15000, help="docs per source to fit BPE")
+    ap.add_argument("--tok_sample_docs", type=int, default=8000, help="docs per source to fit BPE")
     ap.add_argument("--tokenizer", type=Path, default=None, help="reuse an existing tokenizer.json")
     ap.add_argument("--hf_token", default=None, help="optional Hugging Face token for gated datasets")
+    ap.add_argument(
+        "--strict_gated",
+        action="store_true",
+        help="fail instead of falling back to ungated textbooks when nampdn-ai gated access is missing",
+    )
     ap.add_argument("--shares", default="", help="override, e.g. tiny_codes=0.5,tiny_math_textbooks=0.5")
     a = ap.parse_args()
+
+    hf_token = resolve_hf_token(a.hf_token, a.cache_dir)
+    if hf_token:
+        print("Using Hugging Face authentication token.", flush=True)
 
     shares = {k: v[4] for k, v in SOURCES.items() if v[4] > 0}
     if a.shares:
@@ -315,8 +461,10 @@ def main() -> None:
 
     # ---- tokenizer (reuse from --tokenizer, or --cache_dir/tokenizer.json, or train fresh)
     cached_tok = a.cache_dir / "tokenizer.json" if a.cache_dir else None
-    tok_source = a.tokenizer if (a.tokenizer and a.tokenizer.is_file()) else (
-        cached_tok if (cached_tok and cached_tok.is_file()) else None
+    tok_source = (
+        a.tokenizer
+        if (a.tokenizer and a.tokenizer.is_file())
+        else (cached_tok if (cached_tok and cached_tok.is_file()) else None)
     )
     if tok_source:
         try:
@@ -328,7 +476,7 @@ def main() -> None:
         print("collecting tokenizer sample from tiny-series & reasoning sources ...", flush=True)
         sample = []
         for name in shares:
-            for i, text in enumerate(stream(name, a.hf_token)):
+            for i, text in enumerate(stream(name, hf_token, a.strict_gated)):
                 if i >= a.tok_sample_docs:
                     break
                 sample.append(text[:20000])
@@ -389,7 +537,7 @@ def main() -> None:
                 while n_train < budget:
                     epochs += 1
                     buf = []
-                    for i, text in enumerate(stream(name, a.hf_token)):
+                    for i, text in enumerate(stream(name, hf_token, a.strict_gated)):
                         if epochs > 1 and i < val_docs:
                             continue
                         buf.append(text)
