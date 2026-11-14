@@ -1,0 +1,22 @@
+# Python bytecode & caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Local virtualenvs
+.venv/
+venv/
+env/
+
+# Datasets, runs & checkpoints (stored on Shared Drive or local scratch)
+data/
+runs/
+*.bin
+*.bin.tmp
+*.pt
+*.pt.tmp
+
+# Build artifacts (keep dist/retnet-300m-colab.zip tracked or rebuild via scripts/make_colab_bundle.sh)
+*.egg-info/
+.DS_Store
