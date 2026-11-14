@@ -23,7 +23,9 @@ Authentication & Automatic Fallback for Gated `nampdn-ai/tiny-*` Datasets:
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
+import logging
 import os
 import shutil
 import sys
@@ -33,11 +35,31 @@ from pathlib import Path
 import numpy as np
 from tokenizers import Regex, Tokenizer, decoders, models, pre_tokenizers, trainers
 
+# Silence noisy huggingface_hub warning ("Repo card metadata block was not found. Setting CardData to empty.")
+logging.getLogger("huggingface_hub.repocard").setLevel(logging.ERROR)
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from retnet.calculator import annotate_arithmetic  # noqa: E402
 
 EOS = "<|endoftext|>"
 CC_CPP, CC_PY3 = 2, 3  # deepmind/code_contests language ids
+_META_KEYS = frozenset(
+    {
+        "id",
+        "url",
+        "source",
+        "domain",
+        "topic",
+        "subtopic",
+        "subject",
+        "title",
+        "programming_language",
+        "language",
+        "lang",
+        "model",
+        "audience",
+    }
+)
 
 
 def _calc(text: str) -> str:
@@ -46,17 +68,23 @@ def _calc(text: str) -> str:
 
 
 def _extract_textbook(r: dict, annotate_math: bool = False) -> list[str]:
-    """Extract textbook content from any `nampdn-ai/tiny-*` or `cosmopedia` row schema."""
-    tb = r.get("textbook")
-    txt = r.get("text") or r.get("content") or r.get("lesson")
-    chosen = None
-    if isinstance(tb, str) and len(tb.strip()) > 30:
-        if not isinstance(txt, str) or len(tb) >= len(txt):
-            chosen = tb.strip()
-    if chosen is None and isinstance(txt, str) and txt.strip():
-        chosen = txt.strip()
-    if not chosen:
+    """Extract textbook content from any `nampdn-ai/tiny-*` or `cosmopedia`/`finemath` row schema.
+
+    Picks the longest substantive string across known textbook columns or any non-metadata string
+    column, and filters out short/stub strings (< 60 chars) such as bare titles or topic tags.
+    """
+    candidates: list[str] = []
+    for k in ("textbook", "markdown", "text", "content", "lesson", "body", "document", "output", "response"):
+        v = r.get(k)
+        if isinstance(v, str) and len(v.strip()) >= 60:
+            candidates.append(v.strip())
+    if not candidates:
+        for k, v in r.items():
+            if k not in _META_KEYS and isinstance(v, str) and len(v.strip()) >= 60:
+                candidates.append(v.strip())
+    if not candidates:
         return []
+    chosen = max(candidates, key=len)
     return [_calc(chosen) if annotate_math else chosen]
 
 
@@ -265,6 +293,7 @@ def resolve_hf_token(explicit_token: str | None = None, cache_dir: Path | None =
 
 
 _WARNED_FALLBACKS: set[str] = set()
+_FORCED_FALLBACKS: set[str] = set()
 
 
 def _open_hf_stream(path: str, config: str | None, split: str, token: str | None):
@@ -286,35 +315,70 @@ def _open_hf_stream(path: str, config: str | None, split: str, token: str | None
     return first, it
 
 
+def _switch_to_fallback(name: str, path: str, reason: str, hf_token: str | None):
+    fb_path, fb_cfg, fb_split, fb_fmt = UNGATED_FALLBACKS[name]
+    _FORCED_FALLBACKS.add(name)
+    if name not in _WARNED_FALLBACKS:
+        _WARNED_FALLBACKS.add(name)
+        print(
+            f"  [note] {path} ({reason}); "
+            f"automatically using ungated textbook/code dataset '{fb_path}'"
+            + (f" ({fb_cfg})" if fb_cfg else "")
+            + ".",
+            flush=True,
+        )
+    try:
+        first, it = _open_hf_stream(fb_path, fb_cfg, fb_split, hf_token)
+        return first, it, fb_fmt
+    except Exception as e2:
+        raise SystemExit(
+            f"error: could not open {path} or fallback {fb_path}: {e2!r}"
+        ) from e2
+
+
 def stream(name: str, hf_token: str | None = None, strict_gated: bool = False):
     path, config, split, fmt, _ = SOURCES[name]
-    try:
-        first, it = _open_hf_stream(path, config, split, hf_token)
-    except Exception as e:
-        if not strict_gated and name in UNGATED_FALLBACKS:
-            fb_path, fb_cfg, fb_split, fb_fmt = UNGATED_FALLBACKS[name]
-            if name not in _WARNED_FALLBACKS:
-                _WARNED_FALLBACKS.add(name)
-                print(
-                    f"  [note] {path} is gated on Hugging Face ({type(e).__name__}); "
-                    f"automatically using ungated textbook/code dataset '{fb_path}'"
-                    + (f" ({fb_cfg})" if fb_cfg else "")
-                    + ".\n         (To use nampdn-ai directly: accept terms at "
-                    f"https://huggingface.co/datasets/{path} and set HF_TOKEN.)",
-                    flush=True,
+    if not strict_gated and name in _FORCED_FALLBACKS and name in UNGATED_FALLBACKS:
+        fb_path, fb_cfg, fb_split, fmt = UNGATED_FALLBACKS[name]
+        first, it = _open_hf_stream(fb_path, fb_cfg, fb_split, hf_token)
+    else:
+        try:
+            first, it = _open_hf_stream(path, config, split, hf_token)
+        except Exception as e:
+            if not strict_gated and name in UNGATED_FALLBACKS:
+                first, it, fmt = _switch_to_fallback(
+                    name, path, f"gated on Hugging Face: {type(e).__name__}", hf_token
                 )
-            try:
-                first, it = _open_hf_stream(fb_path, fb_cfg, fb_split, hf_token)
-                fmt = fb_fmt
-            except Exception as e2:
+            else:
                 raise SystemExit(
-                    f"error: could not open {path} or fallback {fb_path}: {e2!r}"
-                ) from e2
+                    f"error: could not open {path} ({config}): {e!r}\n"
+                    f"Accept dataset terms at https://huggingface.co/datasets/{path} and pass --hf_token (or set HF_TOKEN)."
+                ) from e
+
+        # Probe the first 16 rows: if a draft repo (e.g. `nampdn-ai/tiny-math-textbooks`
+        # `[Not ready yet!]`) yields mostly empty/stub rows (< 200 chars on average),
+        # automatically switch to the full-length fallback dataset.
+        probe_rows = [first, *itertools.islice(it, 15)]
+        probe_texts = [t.strip() for r in probe_rows for t in fmt(r) if t and t.strip()]
+        mean_chars = (sum(len(t) for t in probe_texts) / len(probe_texts)) if probe_texts else 0.0
+        if (len(probe_texts) < max(1, len(probe_rows) // 2) or mean_chars < 200.0) and (
+            not strict_gated and name in UNGATED_FALLBACKS
+        ):
+            first, it, fmt = _switch_to_fallback(
+                name,
+                path,
+                f"rows are incomplete/stub (avg {mean_chars:.0f} chars across {len(probe_rows)} rows)",
+                hf_token,
+            )
         else:
-            raise SystemExit(
-                f"error: could not open {path} ({config}): {e!r}\n"
-                f"Accept dataset terms at https://huggingface.co/datasets/{path} and pass --hf_token (or set HF_TOKEN)."
-            ) from e
+            for t in probe_texts:
+                yield t
+            for row in it:
+                for text in fmt(row):
+                    text = text.strip()
+                    if text:
+                        yield text
+            return
 
     for text in fmt(first):
         text = text.strip()
@@ -406,8 +470,11 @@ def _valid_shard(cache_dir: Path, name: str, budget: int) -> dict | None:
         info = json.loads(meta_p.read_text())
         n_tr = int(info["train_tokens"])
         n_va = int(info["val_tokens"])
+        passes = int(info.get("passes", 0))
         if tr_p.stat().st_size == n_tr * 2 and va_p.stat().st_size == n_va * 2:
-            if n_tr >= int(0.95 * budget) or int(info.get("passes", 0)) > 50:
+            if budget >= 50_000_000 and passes > 10:
+                return None  # invalidate corrupted/short-row multi-pass shard
+            if n_tr >= int(0.95 * budget) or passes > 50:
                 return info
     except Exception:
         pass
@@ -532,6 +599,9 @@ def main() -> None:
             n_train = n_val = 0
             epochs = 0
             t0 = time.time()
+            last_log_t = t0
+            last_log_tok = 0
+            log_step = max(2_000_000, budget // 10)
             val_docs = 0
             try:
                 while n_train < budget:
@@ -541,7 +611,7 @@ def main() -> None:
                         if epochs > 1 and i < val_docs:
                             continue
                         buf.append(text)
-                        if len(buf) < 512:
+                        if len(buf) < 1024:
                             continue
                         arr = encode(tok, buf, eos_id)
                         to_val = epochs == 1 and n_val < val_budget
@@ -559,13 +629,16 @@ def main() -> None:
                             n_train += arr.size
                             if n_train >= budget:
                                 break
-                        rate = (n_train + n_val) / max(1e-9, time.time() - t0)
-                        print(
-                            f"\r  {name}: {n_train / 1e6:8.1f}M / {budget / 1e6:.0f}M train tokens"
-                            f"  ({rate / 1e3:.0f}k tok/s)",
-                            end="",
-                            flush=True,
-                        )
+                        now = time.time()
+                        if (n_train - last_log_tok) >= log_step or (now - last_log_t) >= 20.0:
+                            rate = (n_train + n_val) / max(1e-9, now - t0)
+                            print(
+                                f"  {name}: {n_train / 1e6:7.1f}M / {budget / 1e6:.0f}M train tokens"
+                                f"  ({rate / 1e3:.0f}k tok/s, pass {epochs})",
+                                flush=True,
+                            )
+                            last_log_t = now
+                            last_log_tok = n_train
                     if buf and n_train < budget:
                         arr = encode(tok, buf, eos_id)
                         train.write(arr)
@@ -588,7 +661,7 @@ def main() -> None:
                 raise
 
             print(
-                f"\n  {name}: {n_train / 1e6:.1f}M train, {n_val / 1e6:.2f}M val, {epochs} pass(es)",
+                f"  {name}: done — {n_train / 1e6:.1f}M train, {n_val / 1e6:.2f}M val, {epochs} pass(es)",
                 flush=True,
             )
             counts[name] = {

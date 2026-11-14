@@ -121,9 +121,22 @@ def test_drive_token_cache_rejects_partial_copy(tmp_path: Path):
 
 def test_tiny_series_extractors():
     # tiny-textbooks: `textbook` has full synthesized lesson, `text` has shorter seed snippet
-    row_tb = {"text": "short web snippet", "textbook": "Chapter 1: Recursion is a method where 2 + 3 = 5 in base 10."}
+    row_tb = {
+        "text": "short web snippet",
+        "textbook": "Chapter 1: Recursion is a method where 2 + 3 = 5 in base 10, allowing functions to call themselves.",
+    }
     assert _extract_textbook(row_tb, annotate_math=True) == [
-        "Chapter 1: Recursion is a method where 2 + 3 = <<2+3=5>>5 in base 10."
+        "Chapter 1: Recursion is a method where 2 + 3 = <<2+3=5>>5 in base 10, allowing functions to call themselves."
+    ]
+    # Short/stub rows (< 60 chars, e.g. bare topic names in draft repos) are filtered out
+    assert _extract_textbook({"text": "Algebra", "topic": "Math"}) == []
+    # Unknown column names with substantive textbook content are automatically discovered
+    row_custom = {
+        "topic": "Linear Algebra",
+        "markdown_lesson": "Eigenvalues and eigenvectors satisfy A v = lambda v, where 4 * 5 = 20 is a scalar product example.",
+    }
+    assert _extract_textbook(row_custom, annotate_math=True) == [
+        "Eigenvalues and eigenvectors satisfy A v = lambda v, where 4 * 5 = <<4*5=20>>20 is a scalar product example."
     ]
     # tiny-codes: prompt + response + programming_language
     row_code = {
