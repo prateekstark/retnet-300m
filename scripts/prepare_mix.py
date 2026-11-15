@@ -34,6 +34,7 @@ Resuming across Colab disconnects and accounts:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import itertools
 import json
 import logging
@@ -57,6 +58,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from retnet.calculator import annotate_arithmetic  # noqa: E402
 
 EOS = "<|endoftext|>"
+# Reserved for post-training (ids 1..16, right after EOS=0), so latent-thought
+# markers (<bot>/<eot>), pause tokens or chat roles can be added later without
+# changing the tokenizer or re-tokenizing the corpus. Planned use:
+#   reserved_0 = <bot> (begin latent thought), reserved_1 = <eot> (end latent
+#   thought), reserved_2 = <pause>; the rest are unassigned.
+N_RESERVED = 16
+RESERVED_TOKENS = [f"<|reserved_{i}|>" for i in range(N_RESERVED)]
+SPECIAL_TOKENS = [EOS, *RESERVED_TOKENS]
 CC_CPP, CC_PY3 = 2, 3  # deepmind/code_contests language ids
 _META_KEYS = frozenset(
     {
@@ -416,7 +425,10 @@ def resolve_source(
             raise SystemExit(f"error: fallback {fb.path} also unusable: {fb_reason}")
         src = fb
     if choice is not None:
-        _write_json(choice, {"kind": src.kind, "path": src.path, "config": src.config})
+        try:
+            _write_json(choice, {"kind": src.kind, "path": src.path, "config": src.config})
+        except OSError as e:
+            print(f"  warning: could not record source choice in {choice}: {e}", flush=True)
     _RESOLVED[name] = src
     return src
 
@@ -485,18 +497,37 @@ def train_tokenizer(sample_texts: list[str], vocab_size: int) -> Tokenizer:
     tok = make_tokenizer()
     trainer = trainers.BpeTrainer(
         vocab_size=vocab_size,
-        special_tokens=[EOS],
+        special_tokens=SPECIAL_TOKENS,
         min_frequency=2,
         show_progress=False,
         initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
     )
     tok.train_from_iterator(sample_texts, trainer=trainer)
+    missing = tokenizer_problem(tok)
+    if missing:
+        raise RuntimeError(f"trained tokenizer is invalid: {missing}")
     return tok
+
+
+def tokenizer_problem(tok: Tokenizer) -> str | None:
+    """None if `tok` has EOS=0 and the reserved tokens at ids 1..N_RESERVED, fits uint16."""
+    if tok.get_vocab_size() > 65535:
+        return f"vocab {tok.get_vocab_size()} does not fit uint16"
+    for i, t in enumerate(SPECIAL_TOKENS):
+        if tok.token_to_id(t) != i:
+            return f"{t} is not token id {i} (tokenizer predates reserved tokens?)"
+    return None
+
+
+def tokenizer_fingerprint(tok: Tokenizer) -> str:
+    """Shards are only reusable with the exact tokenizer that produced them."""
+    return hashlib.sha256(tok.to_str().encode()).hexdigest()[:16]
 
 
 def _write_json(path: Path, obj: dict) -> None:
     """Write JSON via tmp+replace; fall back to in-place on Drive files owned
-    by another Google account (where replace is denied)."""
+    by another Google account (where replace is denied). Raises OSError if both
+    fail; callers decide whether that is fatal."""
     text = json.dumps(obj, indent=2)
     tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     try:
@@ -543,10 +574,17 @@ def _open_part(path: Path, n_tokens: int) -> tuple[Path, object]:
         f = open(path, "r+b") if path.exists() else open(path, "w+b")
     except OSError:
         new = path.with_name(f"{path.stem}.{os.getpid()}{path.suffix}")
-        shutil.copyfile(path, new)
-        path, f = new, open(new, "r+b")
-    f.truncate(n_tokens * 2)
-    f.seek(n_tokens * 2)
+        try:
+            shutil.copyfile(path, new)
+            path, f = new, open(new, "r+b")
+        except OSError as e:
+            raise SystemExit(f"error: cannot write shard {path} or a copy of it: {e}") from e
+    try:
+        f.truncate(n_tokens * 2)
+        f.seek(n_tokens * 2)
+    except OSError as e:
+        f.close()
+        raise SystemExit(f"error: cannot resize shard {path}: {e}") from e
     return path, f
 
 
@@ -564,13 +602,18 @@ def _count_docs(path: Path, eos_id: int, chunk: int = 1 << 26) -> int:
     return sum(int(np.count_nonzero(data[i : i + chunk] == eos_id)) for i in range(0, len(data), chunk))
 
 
-def valid_shard(shard_dir: Path, name: str, budget: int, eos_id: int) -> dict | None:
-    """The meta of a finished, size-verified, non-stub shard for `name`, else None."""
+def valid_shard(shard_dir: Path, name: str, budget: int, eos_id: int,
+                tok_hash: str | None = None) -> dict | None:
+    """The meta of a finished, size-verified, non-stub shard for `name` built with
+    tokenizer `tok_hash` (when given), else None."""
     p = _shard_paths(shard_dir, name)
     if not (p["meta"].is_file() and p["train"].is_file() and p["val"].is_file()):
         return None
     try:
         info = json.loads(p["meta"].read_text())
+        if tok_hash is not None and info.get("tokenizer") != tok_hash:
+            print(f"  {name}: cached shard was built with a different tokenizer; rebuilding", flush=True)
+            return None
         n_tr, n_va = int(info["train_tokens"]), int(info["val_tokens"])
         if p["train"].stat().st_size != n_tr * 2 or p["val"].stat().st_size != n_va * 2:
             return None
@@ -610,7 +653,9 @@ def build_shard(
     last saved progress and continues streaming from the same row.
     """
     p = _shard_paths(shard_dir, name)
-    fresh = {"version": SHARD_VERSION, "source": src.kind, "path": src.path, "pass": 1, "rows": 0,
+    tok_hash = tokenizer_fingerprint(tok)
+    fresh = {"version": SHARD_VERSION, "tokenizer": tok_hash, "source": src.kind, "path": src.path,
+             "pass": 1, "rows": 0,
              "val_rows": 0, "n_train": 0, "n_val": 0, "docs": 0,
              "train_part": f"{name}.train.part", "val_part": f"{name}.val.part"}
     st = dict(fresh)
@@ -619,22 +664,32 @@ def build_shard(
             prev = json.loads(p["progress"].read_text())
             tr, va = shard_dir / prev["train_part"], shard_dir / prev["val_part"]
             if (prev.get("version") == SHARD_VERSION and prev.get("path") == src.path
-                    and tr.is_file() and va.is_file()
-                    and tr.stat().st_size >= 2 * prev["n_train"] and va.stat().st_size >= 2 * prev["n_val"]):
+                    and prev.get("tokenizer") == tok_hash
+                    and (prev.get("finalizing") or (
+                        tr.is_file() and va.is_file()
+                        and tr.stat().st_size >= 2 * prev["n_train"]
+                        and va.stat().st_size >= 2 * prev["n_val"]))):
                 st = prev
                 print(f"  {name}: resuming at pass {st['pass']}, row {st['rows']:,} "
                       f"({st['n_train'] / 1e6:.1f}M train tokens already done)", flush=True)
         except Exception:
             st = dict(fresh)
 
+    if st.get("finalizing"):
+        return _finalize(name, p, st, shard_dir / st["train_part"], shard_dir / st["val_part"], src.path)
+
     tr_path, ftr = _open_part(shard_dir / st["train_part"], st["n_train"])
     va_path, fva = _open_part(shard_dir / st["val_part"], st["n_val"])
     st["train_part"], st["val_part"] = tr_path.name, va_path.name
 
     def save_progress():
-        _fsync(ftr)
-        _fsync(fva)
-        _write_json(p["progress"], st)
+        """Best effort: a transient Drive error only costs resume granularity."""
+        try:
+            _fsync(ftr)
+            _fsync(fva)
+            _write_json(p["progress"], st)
+        except OSError as e:
+            print(f"  warning: could not save progress for {name}: {e}", flush=True)
 
     t0 = last_save = last_log = time.time()
     tok0 = st["n_train"] + st["n_val"]
@@ -703,20 +758,40 @@ def build_shard(
         ftr.close()
         fva.close()
 
-    # Finalize: parts become the shard; meta.json is written last (it marks completion).
-    for part, final in ((tr_path, p["train"]), (va_path, p["val"])):
-        try:
-            os.replace(part, final)
-        except OSError:  # another account owns `final`: overwrite in place
-            shutil.copyfile(part, final)
-            _remove(part)
-    info = {"version": SHARD_VERSION, "source": src.path, "train_tokens": st["n_train"],
-            "val_tokens": st["n_val"], "passes": st["pass"], "docs": st["docs"]}
-    _write_json(p["meta"], info)
-    _remove(p["progress"])
+    st["finalizing"] = True  # a crash from here on resumes in _finalize, not from scratch
+    try:
+        _write_json(p["progress"], st)  # part files are already closed and fsynced
+    except OSError as e:
+        print(f"  warning: could not save progress for {name}: {e}", flush=True)
+    info = _finalize(name, p, st, tr_path, va_path, src.path)
     print(f"  {name}: done, {st['n_train'] / 1e6:.1f}M train, {st['n_val'] / 1e6:.2f}M val, "
           f"{st['pass']} pass(es), {(st['n_train'] + st['n_val']) / max(1, st['docs']):.0f} tokens/doc",
           flush=True)
+    return info
+
+
+def _finalize(name: str, p: dict[str, Path], st: dict, tr_path: Path, va_path: Path, src_path: str) -> dict:
+    """Move finished parts into place, then write meta.json (which marks completion).
+
+    Idempotent: if a previous attempt already moved a part, the final file is
+    accepted when its size matches the recorded token count."""
+    try:
+        for part, final, n_tok in ((tr_path, p["train"], st["n_train"]), (va_path, p["val"], st["n_val"])):
+            if not part.exists() and final.is_file() and final.stat().st_size == 2 * n_tok:
+                continue  # moved by an earlier, interrupted finalize
+            try:
+                os.replace(part, final)
+            except OSError:  # another account owns `final`: overwrite in place
+                shutil.copyfile(part, final)
+                _remove(part)
+        info = {"version": SHARD_VERSION, "tokenizer": st["tokenizer"], "source": src_path,
+                "train_tokens": st["n_train"], "val_tokens": st["n_val"], "passes": st["pass"],
+                "docs": st["docs"]}
+        _write_json(p["meta"], info)
+    except OSError as e:
+        raise SystemExit(f"error: could not finalize shard {name} in {p['meta'].parent}: {e}\n"
+                         "The tokenized data is kept; rerun to finish without re-streaming.") from e
+    _remove(p["progress"])
     return info
 
 
@@ -731,15 +806,20 @@ def _concat(out: Path, parts: list[tuple[Path, int]]) -> int:
     """Concatenate token files into `out` (written as .tmp, renamed on success)."""
     tmp = out.with_suffix(out.suffix + ".tmp")
     n = 0
-    with open(tmp, "wb") as f:
-        for src, n_tok in parts:
-            with open(src, "rb") as g:
-                shutil.copyfileobj(g, f, length=16 * 1024 * 1024)
-            n += n_tok
-        _fsync(f)
-    if tmp.stat().st_size != 2 * n:
-        raise SystemExit(f"error: {out} size mismatch after concatenation")
-    tmp.replace(out)
+    try:
+        with open(tmp, "wb") as f:
+            for src, n_tok in parts:
+                with open(src, "rb") as g:
+                    shutil.copyfileobj(g, f, length=16 * 1024 * 1024)
+                n += n_tok
+            _fsync(f)
+        if tmp.stat().st_size != 2 * n:
+            raise OSError(f"size {tmp.stat().st_size} != {2 * n} bytes")
+        tmp.replace(out)
+    except OSError as e:
+        _remove(tmp)
+        raise SystemExit(f"error: could not write {out}: {e}\n"
+                         "Shards are kept; free disk space and rerun to concatenate again.") from e
     return n
 
 
@@ -800,13 +880,27 @@ def main() -> None:
     cached_tok = shard_dir / "tokenizer.json"
     tok_source = a.tokenizer if (a.tokenizer and a.tokenizer.is_file()) else (
         cached_tok if cached_tok.is_file() else None)
+    tok = None
+    replace_cached_tok = False
     if tok_source:
         try:
             tok = Tokenizer.from_file(str(tok_source))
         except Exception as e:
-            raise SystemExit(f"error: could not load tokenizer {tok_source}: {e!r}")
-        print(f"reusing tokenizer {tok_source} (vocab {tok.get_vocab_size()})", flush=True)
-    else:
+            raise SystemExit(f"error: could not load tokenizer {tok_source}: {e!r}") from e
+        problem = tokenizer_problem(tok)
+        if problem and tok_source != cached_tok:
+            raise SystemExit(f"error: --tokenizer {tok_source}: {problem}")
+        if problem:  # cache from an older prepare_mix: set it aside and train a new one
+            print(f"  cached tokenizer unusable ({problem}); retraining, shards will be rebuilt", flush=True)
+            try:
+                os.replace(cached_tok, cached_tok.with_name("tokenizer.legacy.json"))
+            except OSError:
+                _remove(cached_tok)
+            tok = None
+            replace_cached_tok = True  # in case the cached file could not be moved or deleted
+        else:
+            print(f"reusing tokenizer {tok_source} (vocab {tok.get_vocab_size()})", flush=True)
+    if tok is None:
         print("collecting tokenizer sample ...", flush=True)
         sample = []
         for name in shares:
@@ -820,12 +914,11 @@ def main() -> None:
         print(f"training {a.vocab_size}-token digit-splitting BPE on {len(sample)} docs ...", flush=True)
         tok = train_tokenizer(sample, a.vocab_size)
         del sample
-    if tok.get_vocab_size() > 65535 or tok.token_to_id(EOS) is None:
-        raise SystemExit("error: tokenizer must fit uint16 and contain <|endoftext|>")
     eos_id = tok.token_to_id(EOS)
+    tok_hash = tokenizer_fingerprint(tok)
     try:
         tok.save(str(a.out / "tokenizer.json"))
-        if not cached_tok.is_file():
+        if replace_cached_tok or not cached_tok.is_file():
             tok.save(str(cached_tok))
     except Exception as e:
         raise SystemExit(f"error: could not save tokenizer: {e!r}")
@@ -835,7 +928,7 @@ def main() -> None:
     counts: dict[str, dict] = {}
     for name, share in shares.items():
         budget = int(share * a.total_tokens)
-        info = valid_shard(shard_dir, name, budget, eos_id)
+        info = valid_shard(shard_dir, name, budget, eos_id, tok_hash)
         if info is not None:
             print(f"  {name}: cached shard ({info['train_tokens'] / 1e6:.1f}M train, "
                   f"{info['val_tokens'] / 1e6:.2f}M val)", flush=True)
@@ -858,6 +951,7 @@ def main() -> None:
                       "val_range": [pos, pos + c["val_tokens"]]}
         pos += c["val_tokens"]
     meta = {"vocab_size": tok.get_vocab_size(), "eos_id": eos_id, "dtype": "uint16",
+            "tokenizer": tok_hash, "special_tokens": {t: tok.token_to_id(t) for t in SPECIAL_TOKENS},
             "train_tokens": n_train, "val_tokens": pos, "sources": sources, "shares": shares}
     try:
         (a.out / "meta.json").write_text(json.dumps(meta, indent=2))

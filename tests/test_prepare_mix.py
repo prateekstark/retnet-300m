@@ -22,7 +22,7 @@ def _rows(n: int, words: int = 40) -> list[dict]:
 @pytest.fixture
 def tok():
     t = pm.make_tokenizer()
-    tr = trainers.BpeTrainer(vocab_size=400, special_tokens=[pm.EOS], show_progress=False,
+    tr = trainers.BpeTrainer(vocab_size=400, special_tokens=pm.SPECIAL_TOKENS, show_progress=False,
                              initial_alphabet=pre_tokenizers.ByteLevel.alphabet())
     t.train_from_iterator([r["text"] for r in _rows(50)], tr)
     return t
@@ -145,3 +145,71 @@ def test_main_end_to_end_offline(tmp_path, monkeypatch, tok):
     monkeypatch.setattr(pm, "iter_rows", lambda *a, **k: (_ for _ in ()).throw(AssertionError("streamed")))
     pm.main()
     assert json.loads((out / "meta.json").read_text()) == meta
+
+
+def test_tokenizer_reserves_special_tokens():
+    tok = pm.train_tokenizer([r["text"] for r in _rows(50)], 400)
+    assert [tok.token_to_id(t) for t in pm.SPECIAL_TOKENS] == list(range(1 + pm.N_RESERVED))
+    assert pm.tokenizer_problem(tok) is None
+    ids = tok.encode("Natalia sold 48/2 = <<48/2=24>>24 clips.").ids
+    assert min(ids) > pm.N_RESERVED  # ordinary text never produces EOS or reserved ids
+
+
+def test_old_tokenizer_is_rejected_and_shards_rebuilt(tmp_path, monkeypatch, tok):
+    old = pm.make_tokenizer()
+    tr = trainers.BpeTrainer(vocab_size=300, special_tokens=[pm.EOS], show_progress=False,
+                             initial_alphabet=pre_tokenizers.ByteLevel.alphabet())
+    old.train_from_iterator([r["text"] for r in _rows(50)], tr)
+    assert "reserved" in pm.tokenizer_problem(old)
+
+    src = _fake_source(monkeypatch, _rows(300))
+    _build(tok, tmp_path, src, 30_000, 2_000)
+    eos = tok.token_to_id(pm.EOS)
+    assert pm.valid_shard(tmp_path, "fake", 30_000, eos, pm.tokenizer_fingerprint(tok)) is not None
+    assert pm.valid_shard(tmp_path, "fake", 30_000, eos, pm.tokenizer_fingerprint(old)) is None
+
+
+def test_main_retrains_legacy_cached_tokenizer(tmp_path, monkeypatch):
+    rows = [{"question": f"Q{i} how many apples? " * 10, "answer": f"{i} + 1 = {i + 1}\n#### {i + 1}"}
+            for i in range(300)]
+    monkeypatch.setattr(pm, "iter_rows", lambda src, token, skip=0: iter(rows[skip:]))
+    monkeypatch.setattr(pm, "_RESOLVED", {})
+    out, cache = tmp_path / "out", tmp_path / "cache"
+    cache.mkdir()
+    legacy = pm.make_tokenizer()
+    legacy.train_from_iterator(["abc"] * 10, trainers.BpeTrainer(
+        vocab_size=280, special_tokens=[pm.EOS], show_progress=False,
+        initial_alphabet=pre_tokenizers.ByteLevel.alphabet()))
+    legacy.save(str(cache / "tokenizer.json"))
+    monkeypatch.setattr(sys, "argv", ["prepare_mix.py", "--out", str(out), "--cache_dir", str(cache),
+                                      "--vocab_size", "400", "--tok_sample_docs", "100",
+                                      "--total_tokens", "20000", "--val_tokens_per_source", "1000",
+                                      "--shares", "gsm8k=1"])
+    pm.main()
+    meta = json.loads((out / "meta.json").read_text())
+    assert meta["special_tokens"]["<|reserved_0|>"] == 1
+    assert (cache / "tokenizer.legacy.json").is_file()
+    assert pm.tokenizer_problem(pm.Tokenizer.from_file(str(cache / "tokenizer.json"))) is None
+
+
+def test_interrupted_finalize_resumes_without_streaming(tmp_path, monkeypatch, tok):
+    rows = _rows(300)
+    real_write_json = pm._write_json
+
+    def failing_meta_write(path, obj):
+        if path.name.endswith(".meta.json"):
+            raise OSError("simulated Drive error")
+        real_write_json(path, obj)
+
+    monkeypatch.setattr(pm, "_write_json", failing_meta_write)
+    with pytest.raises(SystemExit, match="rerun to finish"):
+        _build(tok, tmp_path, _fake_source(monkeypatch, rows), 30_000, 2_000)
+    assert json.loads((tmp_path / "fake.progress.json").read_text())["finalizing"]
+
+    monkeypatch.setattr(pm, "_write_json", real_write_json)
+    monkeypatch.setattr(pm, "iter_rows", lambda *a, **k: (_ for _ in ()).throw(AssertionError("streamed")))
+    info = _build(tok, tmp_path, pm.Source("primary", "fake/ds", None, "train", lambda r: [r["text"]]),
+                  30_000, 2_000)
+    assert info["train_tokens"] >= 30_000
+    assert pm.valid_shard(tmp_path, "fake", 30_000, tok.token_to_id(pm.EOS),
+                          pm.tokenizer_fingerprint(tok)) is not None

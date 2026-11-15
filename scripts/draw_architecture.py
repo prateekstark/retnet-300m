@@ -169,7 +169,7 @@ def main() -> None:
         4.3,
         0.75,
         "Digit-Split BPE Tokenizer (vocab = 32,000)",
-        "Digits '0'-'9' & '<<', '>>', '=' isolated  |  uint16 stream",
+        "Digits & '<<' '>>' '=' isolated  |  16 reserved ids for post-training",
         fc="#1e293b",
         ec="#64748b",
     )
@@ -634,10 +634,11 @@ def main() -> None:
         2.65,
         4.6,
         1.52,
-        "100% Textbooks, Code & Reasoning Mix (1B Tokens)",
+        "Textbooks, Code & Reasoning Mix (1B Tokens, Resumable)",
         "• tiny-codes (24%) + tiny-code-textbooks (12%) + Magicoder (4%)\n"
-        "• tiny-math-textbooks (20%) + MetaMathQA (12%) + GSM8K (2%)\n"
-        "• tiny-textbooks (14%) + tiny-orca-textbooks (10%) + tiny-lessons (2%)",
+        "• math textbooks (20%, FineMath fallback) + MetaMathQA (12%) + GSM8K (2%)\n"
+        "• tiny-textbooks (14%) + tiny-orca-textbooks (10%) + tiny-lessons (2%)\n"
+        "• per-source shards on Drive, progress saved every 30 s",
         fc="#1e293b",
         ec="#fbbf24",
         fontsize=9.1,
@@ -650,11 +651,11 @@ def main() -> None:
         0.65,
         4.6,
         1.75,
-        "Multi-Account Shared Google Drive Checkpointing",
-        "• Staging: Local SSD /tmp → ckpt_step_XXXXXXX.pt + os.fsync\n"
-        "• Cross-Account ACL Safe: Each account writes new step files\n"
-        "• Quota Safe: 0-byte truncate before unlink + bf16 AdamW moments\n"
-        "• Auto-Fallback: Skips truncated latest file on Colab disconnect",
+        "Free-Tier Budget: Colab T4 (16 GB) + 15 GB Drive per Account",
+        "• Rotate Google accounts; Run All resumes from ckpt_step_XXXXXXX.pt\n"
+        "• Each account writes new step files (no cross-account overwrite)\n"
+        "• 2.5 GB checkpoints (bf16 AdamW moments), 0-byte truncate on prune\n"
+        "• Auto micro-batch + activation checkpointing to fit 16 GB",
         fc="#1e293b",
         ec="#f43f5e",
         fontsize=9.1,
