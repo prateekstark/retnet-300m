@@ -20,3 +20,4 @@ runs/
 # Build artifacts (keep dist/retnet-300m-colab.zip tracked or rebuild via scripts/make_colab_bundle.sh)
 *.egg-info/
 .DS_Store
+.cto-toolkit/
