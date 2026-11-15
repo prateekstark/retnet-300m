@@ -82,3 +82,7 @@ When **Account A** creates `ckpt.pt` in a shared Google Drive folder, Account A 
 4. **Run in Google Colab (from any account)**:
    - Open `colab/retnet_300m_shared.ipynb` in Colab, select a GPU runtime (`T4`, `L4`, or `A100`), and click **Runtime $\rightarrow$ Run all**.
    - When an account's GPU session ends, open the notebook on the next account and click **Runtime $\rightarrow$ Run all**—it verifies the cached dataset on Drive, finds the latest valid `ckpt_step_XXXXXXX.pt`, adapts the micro-batch to the new GPU, and continues training.
+5. **After any code change**: rerun `bash scripts/make_colab_bundle.sh` and upload the new zip, replacing the old one on Drive. Also re-open the notebook from `colab/`. The notebook prints `Code bundle: version …, git …` and stops if the zip on Drive is older than it expects.
+
+### Data preparation resumes mid-source
+`scripts/prepare_mix.py` tokenizes each source into its own shard in the Drive shard cache (`data/tinymix_shards/`). Every 30 s it fsyncs the partial shard and writes `<source>.progress.json`. After a disconnect, the next Run All continues from that point. It does not restart the source. Sources that return placeholder rows are swapped for their ungated fallback. At the time of writing, `nampdn-ai/tiny-math-textbooks` returns `[Not ready yet!]` placeholder rows. Cached shards that average under 32 tokens per document are rebuilt.

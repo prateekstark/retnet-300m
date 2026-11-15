@@ -18,6 +18,17 @@ Authentication & Automatic Fallback for Gated `nampdn-ai/tiny-*` Datasets:
     (`HuggingFaceTB/cosmopedia-100k`, `HuggingFaceTB/finemath` 4+,
     `ise-uiuc/Magicoder-Evol-Instruct-110K`, `deepmind/code_contests`,
     `sahil2801/CodeAlpaca-20k`) unless `--strict_gated` is passed.
+  - A source whose rows are stubs (e.g. `nampdn-ai/tiny-math-textbooks`, whose rows
+    are still "[Not ready yet!]" placeholders) is also replaced by its fallback, and a
+    shard averaging < 32 tokens/doc is rejected. The choice is saved in
+    `<cache_dir>/<source>.source.json` so every session uses the same dataset.
+
+Resuming across Colab disconnects and accounts:
+  - Each source is tokenized into its own shard in `--cache_dir` (on Shared Drive).
+  - Every 30 s the partial shard is fsynced and `<source>.progress.json` records the
+    rows consumed and tokens written; a new session truncates the partial files to
+    that point and continues streaming from the same row.
+  - Finished shards are reused; `train.bin`/`val.bin` are concatenated at the end.
 """
 
 from __future__ import annotations
@@ -27,9 +38,13 @@ import itertools
 import json
 import logging
 import os
+import queue
 import shutil
 import sys
+import threading
 import time
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -292,103 +307,165 @@ def resolve_hf_token(explicit_token: str | None = None, cache_dir: Path | None =
     return None
 
 
-_WARNED_FALLBACKS: set[str] = set()
-_FORCED_FALLBACKS: set[str] = set()
+SHARD_VERSION = 2
+MAX_PASSES = 50  # tiny sources (e.g. gsm8k) are repeated at most this many times
+MIN_TOKENS_PER_DOC = 32  # below this a source is emitting stub rows, not documents
+_PROBE_ROWS = 16
 
 
-def _open_hf_stream(path: str, config: str | None, split: str, token: str | None):
+@dataclass(frozen=True)
+class Source:
+    """One concrete Hugging Face dataset backing a mix entry."""
+
+    kind: str  # "primary" or "fallback"
+    path: str
+    config: str | None
+    split: str
+    fmt: Callable[[dict], list[str]]
+
+
+def get_source(name: str, kind: str) -> Source:
+    if kind == "primary":
+        path, config, split, fmt, _ = SOURCES[name]
+    elif kind == "fallback":
+        path, config, split, fmt = UNGATED_FALLBACKS[name]
+    else:
+        raise ValueError(f"unknown source kind {kind!r}")
+    return Source(kind, path, config, split, fmt)
+
+
+def _load_stream(src: Source, token: str | None):
     from datasets import load_dataset
 
-    kw = {"split": split, "streaming": True}
+    kw = {"split": src.split, "streaming": True}
     if token:
         kw["token"] = token
     try:
-        ds = load_dataset(path, config, **kw)
-    except TypeError:
+        return load_dataset(src.path, src.config, **kw)
+    except TypeError:  # very old `datasets`
         kw.pop("token", None)
         if token:
             kw["use_auth_token"] = token
-        ds = load_dataset(path, config, **kw)
-    # Peek first element to force authentication/gated check immediately
-    it = iter(ds)
-    first = next(it)
-    return first, it
+        return load_dataset(src.path, src.config, **kw)
 
 
-def _switch_to_fallback(name: str, path: str, reason: str, hf_token: str | None):
-    fb_path, fb_cfg, fb_split, fb_fmt = UNGATED_FALLBACKS[name]
-    _FORCED_FALLBACKS.add(name)
-    if name not in _WARNED_FALLBACKS:
-        _WARNED_FALLBACKS.add(name)
-        print(
-            f"  [note] {path} ({reason}); "
-            f"automatically using ungated textbook/code dataset '{fb_path}'"
-            + (f" ({fb_cfg})" if fb_cfg else "")
-            + ".",
-            flush=True,
-        )
-    try:
-        first, it = _open_hf_stream(fb_path, fb_cfg, fb_split, hf_token)
-        return first, it, fb_fmt
-    except Exception as e2:
-        raise SystemExit(
-            f"error: could not open {path} or fallback {fb_path}: {e2!r}"
-        ) from e2
-
-
-def stream(name: str, hf_token: str | None = None, strict_gated: bool = False):
-    path, config, split, fmt, _ = SOURCES[name]
-    if not strict_gated and name in _FORCED_FALLBACKS and name in UNGATED_FALLBACKS:
-        fb_path, fb_cfg, fb_split, fmt = UNGATED_FALLBACKS[name]
-        first, it = _open_hf_stream(fb_path, fb_cfg, fb_split, hf_token)
-    else:
+def iter_rows(src: Source, token: str | None, skip: int = 0) -> Iterator[dict]:
+    """Stream raw rows of `src`, starting after the first `skip` rows."""
+    ds = _load_stream(src, token)
+    if skip:
         try:
-            first, it = _open_hf_stream(path, config, split, hf_token)
-        except Exception as e:
-            if not strict_gated and name in UNGATED_FALLBACKS:
-                first, it, fmt = _switch_to_fallback(
-                    name, path, f"gated on Hugging Face: {type(e).__name__}", hf_token
-                )
-            else:
-                raise SystemExit(
-                    f"error: could not open {path} ({config}): {e!r}\n"
-                    f"Accept dataset terms at https://huggingface.co/datasets/{path} and pass --hf_token (or set HF_TOKEN)."
-                ) from e
+            ds = ds.skip(skip)
+        except AttributeError:
+            return itertools.islice(iter(ds), skip, None)
+    return iter(ds)
 
-        # Probe the first 16 rows: if a draft repo (e.g. `nampdn-ai/tiny-math-textbooks`
-        # `[Not ready yet!]`) yields mostly empty/stub rows (< 200 chars on average),
-        # automatically switch to the full-length fallback dataset.
-        probe_rows = [first, *itertools.islice(it, 15)]
-        probe_texts = [t.strip() for r in probe_rows for t in fmt(r) if t and t.strip()]
-        mean_chars = (sum(len(t) for t in probe_texts) / len(probe_texts)) if probe_texts else 0.0
-        if (len(probe_texts) < max(1, len(probe_rows) // 2) or mean_chars < 200.0) and (
-            not strict_gated and name in UNGATED_FALLBACKS
-        ):
-            first, it, fmt = _switch_to_fallback(
-                name,
-                path,
-                f"rows are incomplete/stub (avg {mean_chars:.0f} chars across {len(probe_rows)} rows)",
-                hf_token,
+
+def _texts(fmt: Callable[[dict], list[str]], row: dict) -> list[str]:
+    return [t for t in (x.strip() for x in fmt(row)) if t]
+
+
+def _probe(src: Source, token: str | None, min_mean_chars: float = 200.0) -> str | None:
+    """None if `src` opens and yields real documents, else the reason it does not."""
+    try:
+        rows = list(itertools.islice(iter_rows(src, token), _PROBE_ROWS))
+    except Exception as e:  # gated, missing, network
+        return f"cannot open: {type(e).__name__}: {str(e)[:160]}"
+    texts = [t for r in rows for t in _texts(src.fmt, r)]
+    mean = sum(map(len, texts)) / len(texts) if texts else 0.0
+    if not rows or len(texts) < max(1, len(rows) // 2) or mean < min_mean_chars:
+        return f"stub rows (avg {mean:.0f} chars over {len(rows)} rows)"
+    return None
+
+
+_RESOLVED: dict[str, Source] = {}
+
+
+def resolve_source(
+    name: str, token: str | None, strict_gated: bool, cache_dir: Path | None
+) -> Source:
+    """Pick the primary dataset for `name`, or its ungated fallback when the
+    primary is gated/unavailable or emits stub rows. The choice is remembered in
+    `cache_dir/<name>.source.json` so every session (and account) keeps
+    building a shard from the same dataset."""
+    if name in _RESOLVED:
+        return _RESOLVED[name]
+    choice = cache_dir / f"{name}.source.json" if cache_dir else None
+    if choice is not None and choice.is_file():
+        try:
+            kind = json.loads(choice.read_text())["kind"]
+            src = get_source(name, kind)
+            _RESOLVED[name] = src
+            return src
+        except Exception:
+            pass
+    src = get_source(name, "primary")
+    # Textbook sources must yield long documents; short Q&A sources only non-empty ones.
+    reason = _probe(src, token, 200.0 if name in UNGATED_FALLBACKS else 1.0)
+    if reason is not None:
+        if strict_gated or name not in UNGATED_FALLBACKS:
+            raise SystemExit(
+                f"error: {src.path}: {reason}\n"
+                f"Accept the terms at https://huggingface.co/datasets/{src.path} and set HF_TOKEN, "
+                "or drop this source with --shares."
             )
-        else:
-            for t in probe_texts:
-                yield t
-            for row in it:
-                for text in fmt(row):
-                    text = text.strip()
-                    if text:
-                        yield text
-            return
+        fb = get_source(name, "fallback")
+        print(f"  [note] {src.path}: {reason}; using ungated '{fb.path}'"
+              + (f" ({fb.config})" if fb.config else ""), flush=True)
+        fb_reason = _probe(fb, token)
+        if fb_reason is not None:
+            raise SystemExit(f"error: fallback {fb.path} also unusable: {fb_reason}")
+        src = fb
+    if choice is not None:
+        _write_json(choice, {"kind": src.kind, "path": src.path, "config": src.config})
+    _RESOLVED[name] = src
+    return src
 
-    for text in fmt(first):
-        text = text.strip()
-        if text:
-            yield text
-    for row in it:
-        for text in fmt(row):
-            text = text.strip()
-            if text:
-                yield text
+
+def stream(name: str, hf_token: str | None = None, strict_gated: bool = False,
+           cache_dir: Path | None = None) -> Iterator[str]:
+    """Documents of mix entry `name` (used for the tokenizer sample)."""
+    src = resolve_source(name, hf_token, strict_gated, cache_dir)
+    for row in iter_rows(src, hf_token):
+        yield from _texts(src.fmt, row)
+
+
+def _prefetch(it: Iterator, depth: int = 8192) -> Iterator:
+    """Pull rows on a background thread so downloading overlaps tokenizing."""
+    q: queue.Queue = queue.Queue(maxsize=depth)
+    done = object()
+    err: list[BaseException] = []
+    stop = threading.Event()
+
+    def work():
+        try:
+            for x in it:
+                if stop.is_set():
+                    return
+                q.put(x)
+        except BaseException as e:  # surfaced in the consumer
+            err.append(e)
+        finally:
+            q.put(done)
+
+    th = threading.Thread(target=work, daemon=True)
+    th.start()
+    try:
+        while True:
+            x = q.get()
+            if x is done:
+                if err:
+                    raise err[0]
+                return
+            yield x
+    finally:
+        stop.set()
+        for _ in range(100):  # unblock a producer stuck on a full queue
+            if not th.is_alive():
+                break
+            try:
+                q.get(timeout=0.05)
+            except queue.Empty:
+                pass
 
 
 def make_tokenizer() -> Tokenizer:
@@ -417,38 +494,36 @@ def train_tokenizer(sample_texts: list[str], vocab_size: int) -> Tokenizer:
     return tok
 
 
-class BinWriter:
-    """Append token arrays to <name>.bin.tmp; rename to .bin only on success."""
+def _write_json(path: Path, obj: dict) -> None:
+    """Write JSON via tmp+replace; fall back to in-place on Drive files owned
+    by another Google account (where replace is denied)."""
+    text = json.dumps(obj, indent=2)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(text)
+        os.replace(tmp, path)
+    except OSError:
+        tmp.unlink(missing_ok=True)
+        path.write_text(text)
 
-    def __init__(self, path: Path):
-        self.path, self.tmp = path, path.with_suffix(".bin.tmp")
-        self.f = open(self.tmp, "wb")
-        self.n = 0
 
-    def write(self, arr: np.ndarray) -> None:
-        arr.tofile(self.f)
-        self.n += arr.size
+def _fsync(f) -> None:
+    f.flush()
+    try:
+        os.fsync(f.fileno())
+    except OSError:
+        pass
 
-    def write_file(self, src_bin: Path, expected_tokens: int) -> None:
-        with open(src_bin, "rb") as src_f:
-            shutil.copyfileobj(src_f, self.f, length=16 * 1024 * 1024)
-        self.n += expected_tokens
 
-    def commit(self) -> None:
-        self.f.flush()
-        try:
-            os.fsync(self.f.fileno())
-        except OSError:
-            pass
-        self.f.close()
-        self.tmp.replace(self.path)
-
-    def abort(self) -> None:
-        try:
-            self.f.close()
-            self.tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
+def _remove(path: Path) -> None:
+    """Truncate then unlink (frees Drive quota even if unlink only trashes it)."""
+    try:
+        if path.is_file():
+            with open(path, "r+b") as f:
+                f.truncate(0)
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def encode(tok: Tokenizer, texts: list[str], eos_id: int) -> np.ndarray:
@@ -459,26 +534,229 @@ def encode(tok: Tokenizer, texts: list[str], eos_id: int) -> np.ndarray:
     return np.asarray(ids, dtype=np.uint16)
 
 
-def _valid_shard(cache_dir: Path, name: str, budget: int) -> dict | None:
-    """Check if a completed per-source shard exists in `cache_dir`."""
-    meta_p = cache_dir / f"{name}.meta.json"
-    tr_p = cache_dir / f"{name}.train.bin"
-    va_p = cache_dir / f"{name}.val.bin"
-    if not (meta_p.is_file() and tr_p.is_file() and va_p.is_file()):
+def _open_part(path: Path, n_tokens: int) -> tuple[Path, object]:
+    """Open `path` for appending after exactly `n_tokens` uint16 tokens.
+
+    If this account may not write a file another account created, continue in
+    a copy this account owns."""
+    try:
+        f = open(path, "r+b") if path.exists() else open(path, "w+b")
+    except OSError:
+        new = path.with_name(f"{path.stem}.{os.getpid()}{path.suffix}")
+        shutil.copyfile(path, new)
+        path, f = new, open(new, "r+b")
+    f.truncate(n_tokens * 2)
+    f.seek(n_tokens * 2)
+    return path, f
+
+
+def _shard_paths(shard_dir: Path, name: str) -> dict[str, Path]:
+    return {
+        "meta": shard_dir / f"{name}.meta.json",
+        "train": shard_dir / f"{name}.train.bin",
+        "val": shard_dir / f"{name}.val.bin",
+        "progress": shard_dir / f"{name}.progress.json",
+    }
+
+
+def _count_docs(path: Path, eos_id: int, chunk: int = 1 << 26) -> int:
+    data = np.memmap(path, dtype=np.uint16, mode="r")
+    return sum(int(np.count_nonzero(data[i : i + chunk] == eos_id)) for i in range(0, len(data), chunk))
+
+
+def valid_shard(shard_dir: Path, name: str, budget: int, eos_id: int) -> dict | None:
+    """The meta of a finished, size-verified, non-stub shard for `name`, else None."""
+    p = _shard_paths(shard_dir, name)
+    if not (p["meta"].is_file() and p["train"].is_file() and p["val"].is_file()):
         return None
     try:
-        info = json.loads(meta_p.read_text())
-        n_tr = int(info["train_tokens"])
-        n_va = int(info["val_tokens"])
-        passes = int(info.get("passes", 0))
-        if tr_p.stat().st_size == n_tr * 2 and va_p.stat().st_size == n_va * 2:
-            if budget >= 50_000_000 and passes > 10:
-                return None  # invalidate corrupted/short-row multi-pass shard
-            if n_tr >= int(0.95 * budget) or passes > 50:
-                return info
+        info = json.loads(p["meta"].read_text())
+        n_tr, n_va = int(info["train_tokens"]), int(info["val_tokens"])
+        if p["train"].stat().st_size != n_tr * 2 or p["val"].stat().st_size != n_va * 2:
+            return None
+        if n_tr < int(0.95 * budget) and int(info.get("passes", 0)) < MAX_PASSES:
+            return None
+        docs = info.get("docs")
+        if docs is None:  # shard from an older prepare_mix: verify it is not stub rows
+            docs = _count_docs(p["train"], eos_id)
+            info["docs"] = docs
+        if n_tr / max(1, docs) < MIN_TOKENS_PER_DOC:
+            print(f"  {name}: cached shard has {n_tr / max(1, docs):.0f} tokens/doc (stub rows); rebuilding",
+                  flush=True)
+            return None
+        return info
     except Exception:
-        pass
-    return None
+        return None
+
+
+def build_shard(
+    name: str,
+    src: Source,
+    tok: Tokenizer,
+    eos_id: int,
+    budget: int,
+    val_budget: int,
+    shard_dir: Path,
+    hf_token: str | None = None,
+    batch_docs: int = 1024,
+    save_every_s: float = 30.0,
+    log_every_s: float = 30.0,
+) -> dict:
+    """Tokenize source `name` into `shard_dir/<name>.{train,val}.bin`.
+
+    Progress (rows consumed, tokens written) is saved every `save_every_s`
+    seconds next to the partial files, so a Colab disconnect costs at most
+    that much work: the next session truncates the partial files back to the
+    last saved progress and continues streaming from the same row.
+    """
+    p = _shard_paths(shard_dir, name)
+    fresh = {"version": SHARD_VERSION, "source": src.kind, "path": src.path, "pass": 1, "rows": 0,
+             "val_rows": 0, "n_train": 0, "n_val": 0, "docs": 0,
+             "train_part": f"{name}.train.part", "val_part": f"{name}.val.part"}
+    st = dict(fresh)
+    if p["progress"].is_file():
+        try:
+            prev = json.loads(p["progress"].read_text())
+            tr, va = shard_dir / prev["train_part"], shard_dir / prev["val_part"]
+            if (prev.get("version") == SHARD_VERSION and prev.get("path") == src.path
+                    and tr.is_file() and va.is_file()
+                    and tr.stat().st_size >= 2 * prev["n_train"] and va.stat().st_size >= 2 * prev["n_val"]):
+                st = prev
+                print(f"  {name}: resuming at pass {st['pass']}, row {st['rows']:,} "
+                      f"({st['n_train'] / 1e6:.1f}M train tokens already done)", flush=True)
+        except Exception:
+            st = dict(fresh)
+
+    tr_path, ftr = _open_part(shard_dir / st["train_part"], st["n_train"])
+    va_path, fva = _open_part(shard_dir / st["val_part"], st["n_val"])
+    st["train_part"], st["val_part"] = tr_path.name, va_path.name
+
+    def save_progress():
+        _fsync(ftr)
+        _fsync(fva)
+        _write_json(p["progress"], st)
+
+    t0 = last_save = last_log = time.time()
+    tok0 = st["n_train"] + st["n_val"]
+    try:
+        while st["n_train"] < budget and st["pass"] <= MAX_PASSES:
+            rows_this_pass = 0
+            buf: list[str] = []
+            buf_rows = 0
+
+            def flush() -> None:
+                nonlocal buf, buf_rows
+                arr = encode(tok, buf, eos_id)
+                st["rows"] += buf_rows
+                st["docs"] += len(buf)
+                if st["pass"] == 1 and st["n_val"] < val_budget:
+                    arr.tofile(fva)
+                    st["n_val"] += arr.size
+                    st["val_rows"] = st["rows"]
+                else:
+                    arr.tofile(ftr)
+                    st["n_train"] += arr.size
+                buf, buf_rows = [], 0
+
+            for row in _prefetch(iter_rows(src, hf_token, skip=st["rows"])):
+                rows_this_pass += 1
+                buf_rows += 1
+                buf.extend(_texts(src.fmt, row))
+                # small batches while filling val, so tiny datasets keep most rows for train
+                filling_val = st["pass"] == 1 and st["n_val"] < val_budget
+                if len(buf) < (min(64, batch_docs) if filling_val else batch_docs):
+                    continue
+                flush()
+                if st["n_train"] >= budget:
+                    break
+                now = time.time()
+                if now - last_save >= save_every_s:
+                    save_progress()
+                    last_save = now
+                if now - last_log >= log_every_s:
+                    rate = (st["n_train"] + st["n_val"] - tok0) / max(1e-9, now - t0)
+                    eta = (budget - st["n_train"]) / max(rate, 1.0)
+                    print(f"  {name}: {st['n_train'] / 1e6:7.1f}M / {budget / 1e6:.0f}M train tokens "
+                          f"| {rate / 1e3:.0f}k tok/s | pass {st['pass']} | ETA {eta / 60:.0f} min", flush=True)
+                    last_log = now
+                if st["docs"] >= 20_000 and (st["n_train"] + st["n_val"]) / st["docs"] < MIN_TOKENS_PER_DOC:
+                    raise SystemExit(
+                        f"error: {src.path} averages {(st['n_train'] + st['n_val']) / st['docs']:.0f} tokens/doc "
+                        "(stub rows). Delete its .source.json/.progress.json in the shard cache and pass "
+                        f"--shares without {name}, or rerun without --strict_gated to use the fallback."
+                    )
+            else:  # end of one pass over the dataset
+                if buf_rows:
+                    flush()
+                if rows_this_pass == 0:
+                    raise SystemExit(f"error: {src.path} has no rows left to train on (all held out for val?)")
+                if st["n_train"] < budget:
+                    st["pass"] += 1
+                    st["rows"] = st["val_rows"]  # later passes skip the rows held out for val
+                save_progress()
+                last_save = time.time()
+                continue
+            save_progress()
+        _fsync(ftr)
+        _fsync(fva)
+    finally:
+        ftr.close()
+        fva.close()
+
+    # Finalize: parts become the shard; meta.json is written last (it marks completion).
+    for part, final in ((tr_path, p["train"]), (va_path, p["val"])):
+        try:
+            os.replace(part, final)
+        except OSError:  # another account owns `final`: overwrite in place
+            shutil.copyfile(part, final)
+            _remove(part)
+    info = {"version": SHARD_VERSION, "source": src.path, "train_tokens": st["n_train"],
+            "val_tokens": st["n_val"], "passes": st["pass"], "docs": st["docs"]}
+    _write_json(p["meta"], info)
+    _remove(p["progress"])
+    print(f"  {name}: done, {st['n_train'] / 1e6:.1f}M train, {st['n_val'] / 1e6:.2f}M val, "
+          f"{st['pass']} pass(es), {(st['n_train'] + st['n_val']) / max(1, st['docs']):.0f} tokens/doc",
+          flush=True)
+    return info
+
+
+def _cleanup_legacy(shard_dir: Path) -> None:
+    """Remove partial shards left by older prepare_mix versions (*.bin.tmp)."""
+    for f in shard_dir.glob("*.bin.tmp"):
+        print(f"  removing stale partial shard {f.name}", flush=True)
+        _remove(f)
+
+
+def _concat(out: Path, parts: list[tuple[Path, int]]) -> int:
+    """Concatenate token files into `out` (written as .tmp, renamed on success)."""
+    tmp = out.with_suffix(out.suffix + ".tmp")
+    n = 0
+    with open(tmp, "wb") as f:
+        for src, n_tok in parts:
+            with open(src, "rb") as g:
+                shutil.copyfileobj(g, f, length=16 * 1024 * 1024)
+            n += n_tok
+        _fsync(f)
+    if tmp.stat().st_size != 2 * n:
+        raise SystemExit(f"error: {out} size mismatch after concatenation")
+    tmp.replace(out)
+    return n
+
+
+def parse_shares(spec: str) -> dict[str, float]:
+    if not spec:
+        return {k: v[4] for k, v in SOURCES.items() if v[4] > 0}
+    shares = {}
+    for kv in spec.split(","):
+        if not kv.strip():
+            continue
+        k, _, v = kv.partition("=")
+        if float(v) > 0:
+            shares[k.strip()] = float(v)
+    unknown = set(shares) - set(SOURCES)
+    if unknown:
+        raise SystemExit(f"error: unknown sources {sorted(unknown)}; choose from {list(SOURCES)}")
+    return shares
 
 
 def main() -> None:
@@ -488,204 +766,99 @@ def main() -> None:
         "--cache_dir",
         type=Path,
         default=None,
-        help="optional directory (e.g. on Shared Drive) to cache completed per-source shards across disconnects",
+        help="directory (e.g. on Shared Drive) holding per-source shards and their resume progress; "
+        "default <out>/shards",
     )
     ap.add_argument("--total_tokens", type=float, default=1e9)
     ap.add_argument("--val_tokens_per_source", type=float, default=1e6)
     ap.add_argument("--vocab_size", type=int, default=32000)
     ap.add_argument("--tok_sample_docs", type=int, default=8000, help="docs per source to fit BPE")
     ap.add_argument("--tokenizer", type=Path, default=None, help="reuse an existing tokenizer.json")
-    ap.add_argument("--hf_token", default=None, help="optional Hugging Face token for gated datasets")
+    ap.add_argument("--hf_token", default=None, help="Hugging Face token (prefer the HF_TOKEN env var)")
     ap.add_argument(
         "--strict_gated",
         action="store_true",
-        help="fail instead of falling back to ungated textbooks when nampdn-ai gated access is missing",
+        help="fail instead of falling back to ungated datasets when a nampdn-ai source is gated or stub",
     )
     ap.add_argument("--shares", default="", help="override, e.g. tiny_codes=0.5,tiny_math_textbooks=0.5")
     a = ap.parse_args()
 
-    hf_token = resolve_hf_token(a.hf_token, a.cache_dir)
-    if hf_token:
-        print("Using Hugging Face authentication token.", flush=True)
-
-    shares = {k: v[4] for k, v in SOURCES.items() if v[4] > 0}
-    if a.shares:
-        shares = {
-            k.strip(): float(v)
-            for k, v in (kv.split("=") for kv in a.shares.split(",") if kv.strip())
-            if float(v) > 0
-        }
-        unknown = set(shares) - set(SOURCES)
-        if unknown:
-            raise SystemExit(f"error: unknown sources {unknown}; choose from {list(SOURCES)}")
-
+    shares = parse_shares(a.shares)
+    shard_dir = a.cache_dir or (a.out / "shards")
     try:
         a.out.mkdir(parents=True, exist_ok=True)
-        if a.cache_dir is not None:
-            a.cache_dir.mkdir(parents=True, exist_ok=True)
+        shard_dir.mkdir(parents=True, exist_ok=True)
     except OSError as e:
         raise SystemExit(f"error: cannot create output/cache directory: {e}")
+    _cleanup_legacy(shard_dir)
 
-    # ---- tokenizer (reuse from --tokenizer, or --cache_dir/tokenizer.json, or train fresh)
-    cached_tok = a.cache_dir / "tokenizer.json" if a.cache_dir else None
-    tok_source = (
-        a.tokenizer
-        if (a.tokenizer and a.tokenizer.is_file())
-        else (cached_tok if (cached_tok and cached_tok.is_file()) else None)
-    )
+    hf_token = resolve_hf_token(a.hf_token, shard_dir)
+    print(f"Hugging Face token: {'found' if hf_token else 'none (gated sources use ungated fallbacks)'}",
+          flush=True)
+
+    # ---- tokenizer: --tokenizer, else the shard cache's, else train one
+    cached_tok = shard_dir / "tokenizer.json"
+    tok_source = a.tokenizer if (a.tokenizer and a.tokenizer.is_file()) else (
+        cached_tok if cached_tok.is_file() else None)
     if tok_source:
         try:
             tok = Tokenizer.from_file(str(tok_source))
-            print(f"reusing tokenizer from {tok_source} (vocab {tok.get_vocab_size()})", flush=True)
         except Exception as e:
             raise SystemExit(f"error: could not load tokenizer {tok_source}: {e!r}")
+        print(f"reusing tokenizer {tok_source} (vocab {tok.get_vocab_size()})", flush=True)
     else:
-        print("collecting tokenizer sample from tiny-series & reasoning sources ...", flush=True)
+        print("collecting tokenizer sample ...", flush=True)
         sample = []
         for name in shares:
-            for i, text in enumerate(stream(name, hf_token, a.strict_gated)):
-                if i >= a.tok_sample_docs:
+            src = resolve_source(name, hf_token, a.strict_gated, shard_dir)
+            n0 = len(sample)
+            for row in iter_rows(src, hf_token):
+                sample.extend(t[:20000] for t in _texts(src.fmt, row))
+                if len(sample) - n0 >= a.tok_sample_docs:
                     break
-                sample.append(text[:20000])
+            print(f"  {name}: {len(sample) - n0} docs from {src.path}", flush=True)
         print(f"training {a.vocab_size}-token digit-splitting BPE on {len(sample)} docs ...", flush=True)
         tok = train_tokenizer(sample, a.vocab_size)
         del sample
-
     if tok.get_vocab_size() > 65535 or tok.token_to_id(EOS) is None:
         raise SystemExit("error: tokenizer must fit uint16 and contain <|endoftext|>")
     eos_id = tok.token_to_id(EOS)
     try:
         tok.save(str(a.out / "tokenizer.json"))
-        if cached_tok is not None and not cached_tok.is_file():
+        if not cached_tok.is_file():
             tok.save(str(cached_tok))
     except Exception as e:
         raise SystemExit(f"error: could not save tokenizer: {e!r}")
-    demo = "Natalia sold 48/2 = <<48/2=24>>24 clips."
-    print("example:", tok.encode(demo).tokens, flush=True)
+    print("example:", tok.encode("Natalia sold 48/2 = <<48/2=24>>24 clips.").tokens, flush=True)
 
-    # ---- token files
-    train, val = BinWriter(a.out / "train.bin"), BinWriter(a.out / "val.bin")
-    counts: dict[str, dict[str, int | list[int]]] = {}
-    try:
-        for name, share in shares.items():
-            budget = int(share * a.total_tokens)
-            val_budget = int(a.val_tokens_per_source)
-            val_start = val.n
+    # ---- one resumable shard per source
+    counts: dict[str, dict] = {}
+    for name, share in shares.items():
+        budget = int(share * a.total_tokens)
+        info = valid_shard(shard_dir, name, budget, eos_id)
+        if info is not None:
+            print(f"  {name}: cached shard ({info['train_tokens'] / 1e6:.1f}M train, "
+                  f"{info['val_tokens'] / 1e6:.2f}M val)", flush=True)
+        else:
+            src = resolve_source(name, hf_token, a.strict_gated, shard_dir)
+            print(f"  {name}: building from {src.path} (budget {budget / 1e6:.0f}M tokens)", flush=True)
+            info = build_shard(name, src, tok, eos_id, budget, int(a.val_tokens_per_source),
+                               shard_dir, hf_token)
+        counts[name] = info
 
-            # Check per-source shard cache if enabled
-            if a.cache_dir is not None:
-                cached_info = _valid_shard(a.cache_dir, name, budget)
-                if cached_info is not None:
-                    n_tr = int(cached_info["train_tokens"])
-                    n_va = int(cached_info["val_tokens"])
-                    epochs = int(cached_info["passes"])
-                    train.write_file(a.cache_dir / f"{name}.train.bin", n_tr)
-                    val.write_file(a.cache_dir / f"{name}.val.bin", n_va)
-                    print(
-                        f"  {name}: restored from shard cache ({n_tr / 1e6:.1f}M train, "
-                        f"{n_va / 1e6:.2f}M val, {epochs} pass(es))",
-                        flush=True,
-                    )
-                    counts[name] = {
-                        "train_tokens": n_tr,
-                        "val_tokens": n_va,
-                        "passes": epochs,
-                        "val_range": [val_start, val.n],
-                    }
-                    continue
-
-            shard_tr = BinWriter(a.cache_dir / f"{name}.train.bin") if a.cache_dir else None
-            shard_va = BinWriter(a.cache_dir / f"{name}.val.bin") if a.cache_dir else None
-            n_train = n_val = 0
-            epochs = 0
-            t0 = time.time()
-            last_log_t = t0
-            last_log_tok = 0
-            log_step = max(2_000_000, budget // 10)
-            val_docs = 0
-            try:
-                while n_train < budget:
-                    epochs += 1
-                    buf = []
-                    for i, text in enumerate(stream(name, hf_token, a.strict_gated)):
-                        if epochs > 1 and i < val_docs:
-                            continue
-                        buf.append(text)
-                        if len(buf) < 1024:
-                            continue
-                        arr = encode(tok, buf, eos_id)
-                        to_val = epochs == 1 and n_val < val_budget
-                        val_docs += len(buf) if to_val else 0
-                        buf = []
-                        if to_val:
-                            val.write(arr)
-                            if shard_va:
-                                shard_va.write(arr)
-                            n_val += arr.size
-                        else:
-                            train.write(arr)
-                            if shard_tr:
-                                shard_tr.write(arr)
-                            n_train += arr.size
-                            if n_train >= budget:
-                                break
-                        now = time.time()
-                        if (n_train - last_log_tok) >= log_step or (now - last_log_t) >= 20.0:
-                            rate = (n_train + n_val) / max(1e-9, now - t0)
-                            print(
-                                f"  {name}: {n_train / 1e6:7.1f}M / {budget / 1e6:.0f}M train tokens"
-                                f"  ({rate / 1e3:.0f}k tok/s, pass {epochs})",
-                                flush=True,
-                            )
-                            last_log_t = now
-                            last_log_tok = n_train
-                    if buf and n_train < budget:
-                        arr = encode(tok, buf, eos_id)
-                        train.write(arr)
-                        if shard_tr:
-                            shard_tr.write(arr)
-                        n_train += arr.size
-                    if epochs > 50:
-                        break  # tiny source; stop repeating
-                if shard_tr and shard_va and a.cache_dir:
-                    shard_tr.commit()
-                    shard_va.commit()
-                    (a.cache_dir / f"{name}.meta.json").write_text(
-                        json.dumps({"train_tokens": n_train, "val_tokens": n_val, "passes": epochs})
-                    )
-            except BaseException:
-                if shard_tr:
-                    shard_tr.abort()
-                if shard_va:
-                    shard_va.abort()
-                raise
-
-            print(
-                f"  {name}: done — {n_train / 1e6:.1f}M train, {n_val / 1e6:.2f}M val, {epochs} pass(es)",
-                flush=True,
-            )
-            counts[name] = {
-                "train_tokens": n_train,
-                "val_tokens": n_val,
-                "passes": epochs,
-                "val_range": [val_start, val.n],
-            }
-        train.commit()
-        val.commit()
-    except BaseException:
-        train.abort()
-        val.abort()
-        raise
-
-    meta = {
-        "vocab_size": tok.get_vocab_size(),
-        "eos_id": eos_id,
-        "dtype": "uint16",
-        "train_tokens": train.n,
-        "val_tokens": val.n,
-        "sources": counts,
-        "shares": shares,
-    }
+    # ---- concatenate shards into train.bin / val.bin (meta.json written last)
+    print("concatenating shards ...", flush=True)
+    paths = {n: _shard_paths(shard_dir, n) for n in counts}
+    n_train = _concat(a.out / "train.bin", [(paths[n]["train"], c["train_tokens"]) for n, c in counts.items()])
+    _concat(a.out / "val.bin", [(paths[n]["val"], c["val_tokens"]) for n, c in counts.items()])
+    pos, sources = 0, {}
+    for n, c in counts.items():
+        sources[n] = {"train_tokens": c["train_tokens"], "val_tokens": c["val_tokens"],
+                      "passes": c["passes"], "docs": c.get("docs"), "source": c.get("source"),
+                      "val_range": [pos, pos + c["val_tokens"]]}
+        pos += c["val_tokens"]
+    meta = {"vocab_size": tok.get_vocab_size(), "eos_id": eos_id, "dtype": "uint16",
+            "train_tokens": n_train, "val_tokens": pos, "sources": sources, "shares": shares}
     try:
         (a.out / "meta.json").write_text(json.dumps(meta, indent=2))
     except OSError as e:

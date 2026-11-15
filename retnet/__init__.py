@@ -1,7 +1,10 @@
+__version__ = "0.4.0"  # bump on any change the Colab notebook depends on
+
 from .model import MODEL_PRESETS, RetNetConfig, RetNetLM, config_from_preset
 from .retention import MultiScaleRetention
 
 __all__ = [
+    "__version__",
     "MODEL_PRESETS",
     "MultiScaleRetention",
     "RetNetConfig",
