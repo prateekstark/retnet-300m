@@ -547,7 +547,7 @@ def main() -> None:
     )
 
     # =========================================================================
-    # PANEL 3 (Right): Three Equivalent Modes + Multi-Account Colab (x: 12.5 .. 17.65)
+    # PANEL 3 (Right): Three Equivalent Modes + Fault-Tolerant Training (x: 12.5 .. 17.65)
     # =========================================================================
     panel3 = FancyBboxPatch(
         (12.45, 0.35),
@@ -563,7 +563,7 @@ def main() -> None:
     ax.text(
         15.05,
         9.5,
-        "3. Triple Mode & Shared Drive Pipeline",
+        "3. Triple Mode & Training Pipeline",
         ha="center",
         va="center",
         color="#38bdf8",
@@ -620,7 +620,7 @@ def main() -> None:
     ax.text(
         15.05,
         4.45,
-        "Tiny-Series Data & Multi-Account Shared Drive",
+        "Tiny-Series Data & Fault-Tolerant Training",
         ha="center",
         va="center",
         color="#fbbf24",
@@ -651,9 +651,9 @@ def main() -> None:
         0.65,
         4.6,
         1.75,
-        "Free-Tier Budget: Colab T4 (16 GB) + 15 GB Drive per Account",
-        "• Rotate Google accounts; Run All resumes from ckpt_step_XXXXXXX.pt\n"
-        "• Each account writes new step files (no cross-account overwrite)\n"
+        "Compute Budget: One 16 GB GPU + 15 GB Storage",
+        "• Preemptible sessions; Run All resumes from ckpt_step_XXXXXXX.pt\n"
+        "• New step file per save; loader skips truncated uploads\n"
         "• 2.5 GB checkpoints (bf16 AdamW moments), 0-byte truncate on prune\n"
         "• Auto micro-batch + activation checkpointing to fit 16 GB",
         fc="#1e293b",
