@@ -105,6 +105,10 @@ print(text)
 - `model.safetensors`: weights (bf16; the LM head is tied to the embedding and not stored)
 - `config.json`: model config and training step
 - `tokenizer.json`: the tokenizer (Hugging Face `tokenizers` format)
+
+## License
+
+Code and weights: MIT. The training datasets keep their own licenses; check them before commercial use.
 """
 
 
