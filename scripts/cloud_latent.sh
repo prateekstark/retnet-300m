@@ -1,10 +1,8 @@
 #!/bin/bash
 # Run the latent-reasoning experiment on a rented GPU (e.g. Vast.ai RTX 5090).
 #
-# On your machine, copy the pretrained weights to the box (1.4 GB, weights only;
-# the optimizer is reset at every curriculum stage anyway):
-#   rsync -avP -e "ssh -p PORT" runs/retnet-300m/{ckpt_step_0015082.pt,tokenizer.json,config.json} \
-#       root@HOST:/workspace/retnet-300m/runs/retnet-300m/
+# Pretrained weights come from the Hugging Face Hub by default
+# (INIT=hf://starkprateek1/retnet-300m); INIT can also be a local run dir.
 #
 # On the box (PyTorch template with CUDA >= 12.8 for RTX 50xx / Blackwell):
 #   git clone https://github.com/prateekstark/retnet-300m /workspace/retnet-300m
@@ -21,7 +19,7 @@ MODES=${MODES:-"latent pause none"}   # latent first: the result that matters
 MAX_STAGE=${MAX_STAGE:-4}
 C=${C:-2}
 METAMATH=${METAMATH:-0}
-INIT=${INIT:-runs/retnet-300m}
+INIT=${INIT:-hf://starkprateek1/retnet-300m}   # or a local run dir
 PY=${PY:-python}
 
 $PY - <<'PY'
@@ -35,11 +33,18 @@ if arch not in torch.cuda.get_arch_list():
              "use a PyTorch image built for CUDA 12.8+ (pip install torch --index-url "
              "https://download.pytorch.org/whl/cu128)")
 PY
-$PY -m pip -q install tokenizers datasets
-ls "$INIT"/ckpt_step_*.pt "$INIT"/tokenizer.json >/dev/null || {
-    echo "missing pretrained weights in $INIT (see the rsync line at the top of this script)"; exit 1; }
+$PY -m pip -q install tokenizers datasets huggingface_hub safetensors
+# Fetch (and cache) the pretrained weights now, so a bad INIT fails before training.
+$PY - "$INIT" <<'PY'
+import sys
+sys.path.insert(0, ".")
+from retnet.checkpoint import load_run
+model, tok, step = load_run(sys.argv[1], "cpu")
+print(f"pretrained weights OK: {sys.argv[1]} step {step}")
+PY
 $PY -m pytest -q tests/test_latent.py
 
+mkdir -p runs
 for MODE in $MODES; do
     OUT=runs/retnet-300m-$MODE
     echo "==================== thought mode: $MODE -> $OUT"
