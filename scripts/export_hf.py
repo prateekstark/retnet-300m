@@ -3,7 +3,8 @@
   python scripts/export_hf.py --run runs/retnet-300m --out export/retnet-300m
   python scripts/export_hf.py --run runs/retnet-300m --out export/retnet-300m --push USER/retnet-300m --private
 
-Writes model.safetensors (weights only, bf16 by default; the tied LM head is
+Writes model.safetensors (weights only, fp32 by default so continued training
+and evals match the original bit for bit; the tied LM head is
 not stored twice), config.json, tokenizer.json and a README model card with the
 eval results found in the run dir. Load it back anywhere with
 `load_run("hf://USER/retnet-300m", device)` or `--init hf://USER/retnet-300m`.
@@ -50,7 +51,7 @@ def _results(run: Path) -> list[str]:
     return rows
 
 
-def model_card(model, step: int, run: Path, repo: str | None) -> str:
+def model_card(model, step: int, run: Path, repo: str | None, dtype: str) -> str:
     cfg = model.cfg
     n = model.num_params(False) / 1e6
     rows = _results(run)
@@ -102,7 +103,7 @@ print(text)
 
 ## Files
 
-- `model.safetensors`: weights (bf16; the LM head is tied to the embedding and not stored)
+- `model.safetensors`: weights ({dtype}; the LM head is tied to the embedding and not stored)
 - `config.json`: model config and training step
 - `tokenizer.json`: the tokenizer (Hugging Face `tokenizers` format)
 
@@ -116,7 +117,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--run", required=True, help="run dir (newest valid checkpoint is exported)")
     ap.add_argument("--out", type=Path, required=True)
-    ap.add_argument("--dtype", default="bf16", choices=["bf16", "fp16", "fp32"])
+    ap.add_argument("--dtype", default="fp32", choices=["bf16", "fp16", "fp32"])
     ap.add_argument("--push", default=None, help="HF repo id to upload to, e.g. USER/retnet-300m")
     ap.add_argument("--private", action="store_true")
     a = ap.parse_args()
@@ -137,7 +138,7 @@ def main() -> None:
         {"architecture": "RetNetLM", "model": model.cfg.to_dict(), "step": step,
          "dtype": a.dtype, "code": GITHUB}, indent=2))
     shutil.copyfile(run / "tokenizer.json", a.out / "tokenizer.json")
-    (a.out / "README.md").write_text(model_card(model, step, run, a.push))
+    (a.out / "README.md").write_text(model_card(model, step, run, a.push, a.dtype))
     size = (a.out / "model.safetensors").stat().st_size / 2**30
     print(f"exported step {step} to {a.out} ({size:.2f} GiB, {a.dtype})")
 
