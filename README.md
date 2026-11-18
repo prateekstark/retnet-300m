@@ -9,6 +9,8 @@ The model is pretrained on synthetic textbooks, code and step-by-step reasoning 
 
 > **Status:** pretraining finished: 15,082 steps, about 494M tokens on one T4, val loss 1.547. Base-model results are below. Latent-reasoning post-training (`scripts/train_latent.py`) is implemented and tested; that run is next.
 
+**Weights:** [huggingface.co/starkprateek1/retnet-300m](https://huggingface.co/starkprateek1/retnet-300m) (fp32 safetensors, MIT). Load with `load_run("hf://starkprateek1/retnet-300m", "cuda")`.
+
 ![RetNet-300M (RetNet 2.0) Architecture](assets/retnet_architecture.png)
 
 ## Highlights
