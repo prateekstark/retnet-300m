@@ -16,14 +16,17 @@ across multiple Google Colab accounts:
      -> Solution: `load_latest_checkpoint` scans all `ckpt_step_*.pt` (and
         `ckpt.pt`) in descending step order and automatically falls back to
         the previous valid checkpoint if the newest one is unreadable.
-  3. Google Drive 15 GB quota & Trash bloat:
-     Deleting multi-GB checkpoints moves them to Drive Trash, which still
-     counts against the owner's 15 GB quota; and non-owners cannot unlink
-     files owned by another account.
-     -> Solution: Before unlinking old checkpoints beyond `keep_ckpts`, we
-        first truncate them to 0 bytes (`truncate(0)` + `fsync`), which
-        Editors ARE permitted to do on files owned by another account! Even if
-        `unlink` is denied or the file goes to Trash, it occupies 0 bytes.
+  3. Pruning must never destroy the only good copy:
+     Drive FUSE `fsync` returns before the upload finishes, and when the Drive
+     quota is full a multi-GB upload fails silently while small writes still
+     sync. Old checkpoints used to be truncated to 0 bytes before deletion;
+     those truncations reached Drive while the new checkpoint never did, which
+     destroyed every usable checkpoint (and each truncated file still kept its
+     2.5 GB old revision, filling the quota further).
+     -> Solution: old checkpoints are only unlinked (recoverable from Trash),
+        never truncated, and only once an older full-size checkpoint that is
+        at least `prune_min_age_s` old remains as a safe anchor. Low free
+        space on the run directory is reported loudly.
 """
 
 from __future__ import annotations
@@ -114,8 +117,8 @@ def restore_optimizer_state(opt: torch.optim.Optimizer, opt_state: dict, device:
 
 
 def _truncate_and_remove(path: Path) -> None:
-    """Truncate file to 0 bytes (reclaiming Drive quota even across accounts or
-    in Drive Trash), then attempt unlink."""
+    """Truncate then unlink. Only for local scratch files: never use it on a
+    checkpoint in the run directory (see module docstring, item 3)."""
     try:
         if path.is_file():
             with open(path, "wb") as f:
@@ -131,6 +134,28 @@ def _truncate_and_remove(path: Path) -> None:
         path.unlink(missing_ok=True)
     except OSError:
         pass
+
+
+def _remove(path: Path) -> None:
+    """Unlink without truncating, so the file stays recoverable from Drive Trash."""
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as e:
+        print(f"warning: could not remove old checkpoint {path.name}: {e}", flush=True)
+
+
+def _warn_if_low_space(run_dir: Path, need_bytes: int) -> None:
+    try:
+        free = shutil.disk_usage(run_dir).free
+    except OSError:
+        return
+    if free < 2 * need_bytes:
+        print(
+            f"WARNING: only {free / 2**30:.1f} GiB free in {run_dir} "
+            f"(checkpoint is {need_bytes / 2**30:.1f} GiB). Uploads may fail silently; "
+            "free space (and empty Drive Trash) now.",
+            flush=True,
+        )
 
 
 def _copy_and_fsync(src: Path, dst: Path) -> None:
@@ -162,9 +187,14 @@ def save_checkpoint(
     run_dir: Path,
     keep_ckpts: int = 2,
     also_write_legacy_ckpt: bool = False,
+    prune_min_age_s: float = 1200.0,
 ) -> Path | None:
     """Stage checkpoint to fast local `/tmp`, sync to `run_dir/ckpt_step_XXXXXXX.pt`,
-    update `latest.json`, and prune old checkpoints (truncating to 0 bytes first).
+    update `latest.json`, and prune old checkpoints.
+
+    Pruning keeps the newest `keep_ckpts` files plus the newest full-size file
+    older than `prune_min_age_s` (an anchor that has had time to upload), and
+    deletes nothing if no such anchor exists.
 
     Never raises on I/O errors so a transient Google Drive hiccup does not
     abort a training run.
@@ -179,8 +209,10 @@ def save_checkpoint(
 
     try:
         torch.save(obj, local_tmp)
-        if local_tmp.stat().st_size < _MIN_VALID_BYTES:
+        size = local_tmp.stat().st_size
+        if size < _MIN_VALID_BYTES:
             raise OSError("serialized checkpoint unexpectedly small")
+        _warn_if_low_space(run_dir, size)
         _copy_and_fsync(local_tmp, target)
         if also_write_legacy_ckpt:
             try:
@@ -203,14 +235,25 @@ def save_checkpoint(
     except OSError:
         pass
 
-    # Rotate older step checkpoints (keep newest `keep_ckpts`)
+    # Rotate older step checkpoints: keep the newest `keep_ckpts` plus an anchor
+    # old enough to have finished uploading; delete nothing without an anchor.
     if keep_ckpts > 0:
-        all_step_ckpts = [
-            p for p in checkpoint_candidates(run_dir) if _step_from_name(p) >= 0
-        ]
-        for old_p in all_step_ckpts[keep_ckpts:]:
-            if old_p != target:
-                _truncate_and_remove(old_p)
+        cands = [p for p in checkpoint_candidates(run_dir) if _step_from_name(p) >= 0]
+        now = time.time()
+        anchor = None
+        for p in cands:
+            try:
+                st = p.stat()
+            except OSError:
+                continue
+            if p != target and now - st.st_mtime >= prune_min_age_s and st.st_size >= 0.9 * size:
+                anchor = p
+                break
+        if anchor is not None:
+            keep = set(cands[:keep_ckpts]) | {anchor, target}
+            for old_p in cands:
+                if old_p not in keep and _step_from_name(old_p) < _step_from_name(anchor):
+                    _remove(old_p)
 
     return target
 

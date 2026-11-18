@@ -161,19 +161,45 @@ def generate_batch_greedy(
     use_calculator: bool = True,
 ) -> list[tuple[str, int]]:
     """Greedy decoding of many prompts at once, calculator in the loop."""
+    state, next_logits, pos_t = prefill_batch(model, [tokenizer.encode(p).ids for p in prompts])
+    return decode_batch_greedy(
+        model, tokenizer, state, next_logits, pos_t, max_new_tokens, eos_id, stop,
+        stop_regex, use_calculator,
+    )
+
+
+@torch.no_grad()
+def prefill_batch(model, prompts_ids: list[list[int]]):
+    """Prefill each prompt separately (different lengths), then stack.
+
+    Returns (state, next_logits (B, V), positions (B,))."""
     device = next(model.parameters()).device
     states, first, pos = [], [], []
-    for p in prompts:
-        ids = tokenizer.encode(p).ids
+    for ids in prompts_ids:
         lg, _, st = model(torch.tensor([ids], device=device), mode="chunkwise", chunk_size=256)
         states.append(st)
         first.append(lg[0, -1])
         pos.append(len(ids))
-    state = _cat_states(states)
-    next_logits = torch.stack(first)
-    pos_t = torch.tensor(pos, device=device)
+    return _cat_states(states), torch.stack(first), torch.tensor(pos, device=device)
+
+
+@torch.no_grad()
+def decode_batch_greedy(
+    model,
+    tokenizer,
+    state,
+    next_logits,
+    pos_t,
+    max_new_tokens: int = 256,
+    eos_id: int | None = 0,
+    stop: tuple[str, ...] = (),
+    stop_regex: str | None = None,
+    use_calculator: bool = True,
+) -> list[tuple[str, int]]:
+    """Greedy decoding from prefilled states, calculator in the loop."""
+    device = next_logits.device
+    n = next_logits.shape[0]
     pattern = re.compile(stop_regex) if stop_regex else None
-    n = len(prompts)
     outs: list[list[int]] = [[] for _ in range(n)]
     queued: list[list[int]] = [[] for _ in range(n)]
     calls, done = [0] * n, [False] * n

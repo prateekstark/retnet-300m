@@ -146,7 +146,32 @@ class RetNetLM(nn.Module):
         return_state: bool = False,
     ) -> tuple[Tensor, Tensor | None, State | None]:
         """Returns (logits, loss, new_state)."""
-        x = self.embed(input_ids)
+        x, new_states, keep_state = self.trunk(
+            self.embed(input_ids), state, offset, mode, chunk_size, return_state
+        )
+        logits = self.lm_head(self.norm_f(x))
+
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(
+                logits.reshape(-1, logits.size(-1)), targets.reshape(-1), ignore_index=-1
+            )
+        return logits, loss, (new_states if keep_state else None)
+
+    def trunk(
+        self,
+        x: Tensor,
+        state: State | None = None,
+        offset: int | Tensor = 0,
+        mode: str = "parallel",
+        chunk_size: int = 64,
+        return_state: bool = False,
+    ) -> tuple[Tensor, list, bool]:
+        """Run the block stack on input embeddings x (B, T, d_model).
+
+        Returns (hidden before norm_f, per-layer states, whether the states are
+        valid). Latent reasoning feeds hidden states back in through this.
+        """
         states = state if state is not None else [None] * len(self.blocks)
         new_states = []
         use_ckpt = (
@@ -167,15 +192,8 @@ class RetNetLM(nn.Module):
             else:
                 x, ns = block(x, s, offset, mode, chunk_size, return_state)
             new_states.append(ns)
-        logits = self.lm_head(self.norm_f(x))
-
-        loss = None
-        if targets is not None:
-            loss = F.cross_entropy(
-                logits.reshape(-1, logits.size(-1)), targets.reshape(-1), ignore_index=-1
-            )
         keep_state = (return_state or mode != "parallel") and not use_ckpt
-        return logits, loss, (new_states if keep_state else None)
+        return x, new_states, keep_state
 
     @torch.no_grad()
     def generate(

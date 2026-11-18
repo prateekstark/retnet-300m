@@ -654,7 +654,7 @@ def main() -> None:
         "Compute Budget: One 16 GB GPU + 15 GB Storage",
         "• Preemptible sessions; Run All resumes from ckpt_step_XXXXXXX.pt\n"
         "• New step file per save; loader skips truncated uploads\n"
-        "• 2.5 GB checkpoints (bf16 AdamW moments), 0-byte truncate on prune\n"
+        "• 2.5 GB checkpoints (bf16 AdamW moments), anchored pruning\n"
         "• Auto micro-batch + activation checkpointing to fit 16 GB",
         fc="#1e293b",
         ec="#f43f5e",

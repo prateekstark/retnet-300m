@@ -7,7 +7,7 @@ A from-scratch PyTorch implementation of a **~310M-parameter Retentive Network (
 
 The model is pretrained on synthetic textbooks, code and step-by-step reasoning data. The whole pipeline is built for a **tight compute budget**: a single 16 GB GPU (Colab T4) in preemptible sessions, with 15 GB of cloud storage for data and checkpoints.
 
-> **Status:** model, data pipeline, training loop, fault-tolerant checkpointing and evaluation are implemented and covered by 146 unit/integration tests (CPU). Pretraining on Colab is the next step; results will be added here once runs finish.
+> **Status:** pretraining finished: 15,082 steps, about 494M tokens on one T4, val loss 1.547. Base-model results are below. Latent-reasoning post-training (`scripts/train_latent.py`) is implemented and tested; that run is next.
 
 ![RetNet-300M (RetNet 2.0) Architecture](assets/retnet_architecture.png)
 
@@ -19,13 +19,24 @@ The model is pretrained on synthetic textbooks, code and step-by-step reasoning 
 - **Fault-tolerant training on preemptible GPUs**: versioned checkpoints, fallback past corrupted files, data prep that resumes partway through a source, and an auto-sized micro-batch for whichever GPU the session gets.
 - **Ready for post-training**: 16 reserved token ids so latent-thought (`<bot>`/`<eot>`) or pause tokens can be added later without re-tokenizing 1B tokens.
 
+## Results (base model, step 15,082)
+
+Zero-shot, greedy decoding, first 256 GSM8K test problems:
+
+| GSM8K | Accuracy |
+|---|---|
+| With calculator in the loop | **7.4% ± 1.6%** (3.0 calls per problem) |
+| Without calculator | 4.7% ± 1.3% |
+
+The calculator gives about 1.6× more correct answers. In the samples, the model usually sets the problem up right but gets the arithmetic wrong (`168 - 150 = 42`); the calculator fills in the exact result. For scale: GPT-2 Medium (355M, ~30B tokens) and Pythia-410M (300B tokens) score about 1–2% on GSM8K.
+
 ## Resource constraints and how the design handles them
 
 | Constraint | Effect | How the project handles it |
 |---|---|---|
 | **Colab T4**: 16 GB VRAM, Turing (no fast bf16), ~12 GB RAM | A 310M model with AdamW and 1024-token sequences barely fits | fp16 + `GradScaler` on T4 (bf16 on L4/A100); retention core kept in fp32 for stability; the largest micro-batch that fits is measured at startup and activation checkpointing is enabled only if needed. Effective batch stays fixed at 32 × 1024 tokens on any GPU |
 | **Preemptible sessions** | Training is cut off every few hours | **Run All** resumes from the newest valid checkpoint, on whatever GPU the next session gets. Checkpoints are saved every 250 steps / 15 min and on stop signals |
-| **15 GB of Drive storage** | A 310M checkpoint with optimizer state is ~3.6 GB; deleted files still count in Trash | Each checkpoint is a new step-numbered file. Old ones are truncated to 0 bytes before deleting. AdamW moments are stored in bf16 (checkpoint ~2.5 GB, 2 kept) |
+| **15 GB of Drive storage** | A 310M checkpoint with optimizer state is ~3.6 GB; deleted files still count in Trash | Each checkpoint is a new step-numbered file. AdamW moments are stored in bf16 (checkpoint ~2.5 GB). Low free space is reported before each save |
 | **Disconnects mid-write** | Truncated checkpoints and half-built datasets | Staged on local SSD and fsynced; the loader skips corrupt checkpoints; data prep saves progress every 30 s and resumes from the same row |
 | **Compute budget** | Default run is 0.5B tokens, well below the ~6B Chinchilla-optimal for 310M params | Data restricted to dense, curated sources (textbooks, code, worked math) to get more from each token; a 125M preset gives cheaper comparisons |
 | **Gated or unfinished datasets** | Some `nampdn-ai/tiny-*` sets are gated; `tiny-math-textbooks` currently serves `[Not ready yet!]` placeholder rows | Each source is probed first and swapped for an ungated fallback (e.g. FineMath-4+) when needed; shards averaging < 32 tokens/doc are rejected |
@@ -63,6 +74,8 @@ flowchart LR
 | `scripts/train.py`, `scripts/eval.py`, `scripts/chat.py` | Training, evaluation suite, interactive chat |
 | `colab/retnet_300m_shared.ipynb` | One-click Colab training notebook (Run All resumes) |
 | `colab/retnet_300m_inference.ipynb` | Colab notebook: generate from the latest checkpoint |
+| `retnet/latent.py`, `scripts/train_latent.py`, `scripts/eval_latent.py` | Latent reasoning: thought feedback, curriculum training, thought-count sweep |
+| `colab/retnet_300m_latent.ipynb` | Colab notebook: latent-reasoning curriculum |
 | `tests/` | Mode equivalence, delta memory, calculator, checkpoint recovery, data-prep resume |
 
 ---
@@ -109,14 +122,14 @@ While fast ($O(1)$ recurrent inference, parallel/chunkwise training), plain addi
 ### Why naive single-file checkpointing (`ckpt.pt`) breaks
 1. **Mid-write disconnects**: Writing a ~2.4 GB checkpoint to Google Drive over FUSE takes 20–40 seconds; if the session is preempted mid-write, a single `ckpt.pt` is left corrupted and the run is lost.
 2. **Cross-GPU (`T4` fp16 vs `L4`/`A100` bf16) `GradScaler` crash**: Resuming a `bf16` checkpoint (where `GradScaler` was disabled and saved `{}`) on a `T4` (where `GradScaler` is enabled for `fp16`) crashes PyTorch if `scaler.load_state_dict({})` is called unconditionally.
-3. **15 GB storage & Trash bloat**: Deleting multi-GB files without truncating them first fills up Drive Trash, which still counts against the quota.
+3. **Pruning that outruns the upload**: Drive's `fsync` returns before the upload finishes, and with the quota full a multi-GB upload fails silently while small writes still sync. Deleting (or worse, truncating) the previous checkpoint at that moment leaves no usable checkpoint. This happened in the real run: every checkpoint after step 15,082 was lost, and step 15,082 was only recovered from Drive's 30-day version history.
 
-### How `retnet-300m` solves them
+### How `retnet-300m` handles them
 1. **Versioned Step Checkpoints (`ckpt_step_XXXXXXX.pt`) + Multi-Candidate Fallback Loader (`retnet/checkpoint.py`)**:
    - Every checkpoint is staged to local SSD (`/tmp`) first, then written as a new step-numbered file `ckpt_step_0000250.pt` and flushed via `os.fsync`. An existing checkpoint is never overwritten.
    - On resume (`load_latest_checkpoint`), all `ckpt_step_*.pt` files are scanned from highest step to lowest; if the newest file was truncated by a sudden disconnect, training automatically falls back to the previous valid checkpoint.
-2. **Zero-Byte Truncation Before Rotation**:
-   - Before pruning checkpoints older than `--keep_ckpts 2`, the file is first truncated to **0 bytes** (`f.truncate(0)` + `os.fsync`), so even if deletion only moves it to Trash, it occupies **0 bytes** of quota.
+2. **Anchored Rotation**:
+   - Besides the newest `--keep_ckpts`, pruning keeps the newest full-size checkpoint that is at least 20 minutes old (time to finish uploading), deletes nothing if there is no such anchor, and only unlinks files (never truncates), so a pruned file is still recoverable from Trash.
 3. **Compact `bfloat16` Optimizer State (`compact_optimizer_state`)**:
    - AdamW moment buffers (`exp_avg`, `exp_avg_sq`) are saved in `bfloat16` on disk and restored to `fp32` on load, shrinking each 300M checkpoint from ~3.6 GB to ~2.4 GB.
 4. **Cross-GPU (`T4` $\leftrightarrow$ `L4`/`A100`) & Auto-Batch Compatibility**:
@@ -142,3 +155,18 @@ While fast ($O(1)$ recurrent inference, parallel/chunkwise training), plain addi
 
 ### Reserved tokens for post-training
 The tokenizer reserves ids 1–16 (`<|reserved_0|>` … `<|reserved_15|>`, right after `<|endoftext|>` = 0). They never appear in pretraining text. They are kept for post-training, for example latent-thought markers (`reserved_0` = `<bot>`, `reserved_1` = `<eot>`) or pause tokens, so those can be added without changing the tokenizer or re-tokenizing the corpus. `meta.json` lists them under `special_tokens`. A cached tokenizer without them is set aside as `tokenizer.legacy.json` and retrained. Shards record the fingerprint of the tokenizer that built them and are rebuilt if it changes.
+
+## 4. Latent Reasoning (Continuous Thought) on RetNet
+
+`retnet/latent.py` and `scripts/train_latent.py` implement Coconut-style latent reasoning (Hao et al., 2024). After the question the model emits `<bot>`, then for `n` steps it feeds its own last hidden state back in as the next input embedding instead of writing tokens, then `<eot>` switches back to text:
+
+```
+Question: ...\nAnswer:<bot> [h1][h2]...[hn] <eot> remaining steps\n#### 42
+```
+
+- **Why RetNet fits:** each thought is one recurrent update of a fixed-size state, so thinking for 1,000 steps uses the same memory as 10. A Transformer's KV cache grows with every thought.
+- **Curriculum:** stage 0 is step-by-step fine-tuning (the explicit chain-of-thought baseline). At stage `s` the first `s` reasoning steps are replaced by `s × c` thoughts, and the optimizer is reset. Gradients flow back through every thought.
+- **Thought input:** `scale · norm_f(h)`, with a learned scalar initialized to the norm of real token embeddings.
+- **Evaluation:** `scripts/eval_latent.py` sweeps the number of thoughts at test time (accuracy vs. thinking length).
+- **Tests:** with zero thoughts the latent path matches an ordinary forward pass exactly; batched thoughts match per-example ones; a two-stage run stopped mid-stage resumes and finishes.
+- **Colab:** `colab/retnet_300m_latent.ipynb`.

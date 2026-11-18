@@ -54,13 +54,12 @@ def test_versioned_checkpoints_and_corrupted_fallback(tmp_path: Path):
     _, _, _, obj200 = _dummy_state(200)
     _, _, _, obj300 = _dummy_state(300)
 
-    p100 = save_checkpoint(obj100, tmp_path, keep_ckpts=2)
-    p200 = save_checkpoint(obj200, tmp_path, keep_ckpts=2)
-    p300 = save_checkpoint(obj300, tmp_path, keep_ckpts=2)
+    p100 = save_checkpoint(obj100, tmp_path, keep_ckpts=2, prune_min_age_s=0)
+    p200 = save_checkpoint(obj200, tmp_path, keep_ckpts=2, prune_min_age_s=0)
+    p300 = save_checkpoint(obj300, tmp_path, keep_ckpts=2, prune_min_age_s=0)
     assert p100 is not None and p200 is not None and p300 is not None
 
-    # Step 100 was pruned (keep_ckpts=2); even if unlink were blocked on Shared Drive,
-    # its size would be truncated to 0 bytes and excluded from candidates.
+    # Step 100 was pruned (keep_ckpts=2, every file counts as uploaded with prune_min_age_s=0).
     cands = checkpoint_candidates(tmp_path)
     assert [c.name for c in cands] == ["ckpt_step_0000300.pt", "ckpt_step_0000200.pt"]
 
@@ -69,6 +68,32 @@ def test_versioned_checkpoints_and_corrupted_fallback(tmp_path: Path):
     ck, loaded_path = load_latest_checkpoint(tmp_path, "cpu")
     assert ck is not None and loaded_path == p200
     assert ck["step"] == 200
+
+
+def test_pruning_keeps_an_uploaded_anchor_and_never_truncates(tmp_path: Path):
+    """Drive FUSE fsync returns before upload: fresh checkpoints may never reach
+    Drive. Old checkpoints must survive until an older full-size one is safely aged."""
+    import os
+    import time
+
+    objs = [_dummy_state(s)[3] for s in (100, 200, 300, 400)]
+    p100 = save_checkpoint(objs[0], tmp_path, keep_ckpts=2)
+    old = time.time() - 3600
+    os.utime(p100, (old, old))  # step 100 has had an hour to upload
+    save_checkpoint(objs[1], tmp_path, keep_ckpts=2)
+    save_checkpoint(objs[2], tmp_path, keep_ckpts=2)
+    save_checkpoint(objs[3], tmp_path, keep_ckpts=2)
+    # 200..400 are fresh (maybe not uploaded): 100 stays as the anchor, nothing truncated.
+    names = sorted(p.name for p in tmp_path.glob("ckpt_step_*.pt"))
+    assert names == [f"ckpt_step_{s:07d}.pt" for s in (100, 200, 300, 400)]
+    assert all(p.stat().st_size > 1024 for p in tmp_path.glob("ckpt_step_*.pt"))
+
+    # Once 300 has aged too, it becomes the anchor and 100/200 are unlinked.
+    for s in (200, 300):
+        os.utime(tmp_path / f"ckpt_step_{s:07d}.pt", (old, old))
+    save_checkpoint(_dummy_state(500)[3], tmp_path, keep_ckpts=2)
+    names = sorted(p.name for p in tmp_path.glob("ckpt_step_*.pt"))
+    assert names == [f"ckpt_step_{s:07d}.pt" for s in (300, 400, 500)]
 
 
 def test_compact_optimizer_roundtrip():
