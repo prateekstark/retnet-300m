@@ -116,6 +116,26 @@ def test_gradient_flows_through_thoughts(tok):
     assert r.scale.grad is None or r.scale.grad.abs() == 0
 
 
+def test_ablation_modes(tok):
+    """'none' uses no thought slots (same loss as 0 thoughts); 'pause' feeds the
+    learned <pause> embedding, which then receives the gradient instead of `scale`."""
+    from retnet.latent import PAUSE
+
+    ids = special_ids(tok)
+    batch = [encode(tok, p, 1, ids) for p in _problems(3)]
+    m = _model(tok, seed=5)
+    none = LatentReasoner(m, thought_mode="none")
+    assert torch.allclose(none.loss(batch, 4, 8), LatentReasoner(m).loss(batch, 0, 8))
+    m = _model(tok, seed=5).float().train()
+    pause_id = tok.token_to_id(PAUSE)
+    r = LatentReasoner(m, scale=0.5, thought_mode="pause", pause_id=pause_id)
+    r.loss(batch, 3, 8).backward()
+    assert m.embed.weight.grad[pause_id].abs().sum() > 0
+    assert r.scale.grad is None
+    with pytest.raises(ValueError):
+        LatentReasoner(m, thought_mode="pause")
+
+
 def test_generate_and_init_scale(tok):
     m = _model(tok, seed=3).float()
     r = LatentReasoner(m)
@@ -126,7 +146,8 @@ def test_generate_and_init_scale(tok):
     assert len(outs) == 2 and all(isinstance(t, str) for t, _ in outs)
 
 
-def test_train_latent_end_to_end_resume(tmp_path, monkeypatch, tok):
+@pytest.mark.parametrize("mode", ["latent", "pause"])
+def test_train_latent_end_to_end_resume(tmp_path, monkeypatch, tok, mode):
     """Two-stage curriculum on a tiny model; a run stopped mid-stage resumes and
     finishes with the stage-1 checkpoint carrying the thought settings."""
     import train_latent as tl
@@ -143,7 +164,7 @@ def test_train_latent_end_to_end_resume(tmp_path, monkeypatch, tok):
     base = ["train_latent.py", "--init", str(init), "--out", str(out), "--max_stage", "1",
             "--c", "2", "--epochs_stage0", "1", "--epochs_per_stage", "1", "--batch_size", "4",
             "--grad_accum", "1", "--eval_limit", "6", "--eval_batch", "3", "--log_every", "2",
-            "--chunk_size", "8", "--device", "cpu", "--resume"]
+            "--chunk_size", "8", "--device", "cpu", "--resume", "--thought_mode", mode]
     monkeypatch.setattr(sys, "argv", base + ["--max_steps", "3"])
     tl.main()
     monkeypatch.setattr(sys, "argv", base)
@@ -152,4 +173,5 @@ def test_train_latent_end_to_end_resume(tmp_path, monkeypatch, tok):
     assert [e["stage"] for e in evals] == [0, 1]
     assert evals[1]["eval"]["n_latent"] == 2
     ck = torch.load(sorted(out.glob("ckpt_step_*.pt"))[-1], weights_only=False)
+    assert ck["latent"]["thought_mode"] == mode
     assert ck["latent"]["stage"] == 1 and ck["latent"]["pos"]["stage"] == 2 and ck["latent"]["c"] == 2 and ck["step"] == 20

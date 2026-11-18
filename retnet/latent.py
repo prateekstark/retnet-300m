@@ -20,6 +20,12 @@ The thought input is `scale * norm_f(h)`: `norm_f(h)` is what the LM head
 reads, and a learned scalar `scale` (initialized to match the token-embedding
 norm) keeps it on the same footing as a real token embedding in the residual
 stream.
+
+Ablations (`thought_mode`), trained with the same curriculum:
+  * "pause": each thought slot gets the same learned `<pause>` embedding, so the
+    model gets the extra compute steps but no fed-back state (Goyal et al., 2023).
+  * "none": the removed steps get no thought slots at all (straight to <eot>).
+Latent reasoning helps only if "latent" beats both at the same stage.
 """
 
 from __future__ import annotations
@@ -36,6 +42,8 @@ from .calculator import _cat_states, annotate_arithmetic, decode_batch_greedy
 BOT = "<|reserved_0|>"  # begin latent thought
 EOT = "<|reserved_1|>"  # end latent thought
 EOS = "<|endoftext|>"
+PAUSE = "<|reserved_2|>"  # ablation: a fixed learned token instead of fed-back state
+THOUGHT_MODES = ("latent", "pause", "none")
 
 
 @dataclass(frozen=True)
@@ -123,10 +131,21 @@ def special_ids(tok) -> dict[str, int]:
 class LatentReasoner(nn.Module):
     """Wraps a RetNetLM with the thought feedback path."""
 
-    def __init__(self, model: nn.Module, scale: float = 1.0) -> None:
+    def __init__(self, model: nn.Module, scale: float = 1.0, thought_mode: str = "latent",
+                 pause_id: int | None = None) -> None:
         super().__init__()
+        if thought_mode not in THOUGHT_MODES:
+            raise ValueError(f"thought_mode must be one of {THOUGHT_MODES}")
+        if thought_mode == "pause" and pause_id is None:
+            raise ValueError("thought_mode='pause' needs pause_id")
         self.model = model
+        self.thought_mode = thought_mode
+        self.pause_id = pause_id
         self.scale = nn.Parameter(torch.tensor(float(scale)))
+
+    def slots(self, n_latent: int) -> int:
+        """Thought slots actually used (0 for the no-thought ablation)."""
+        return 0 if self.thought_mode == "none" else n_latent
 
     @torch.no_grad()
     def init_scale(self, prefixes: list[list[int]], chunk_size: int = 128) -> float:
@@ -163,11 +182,15 @@ class LatentReasoner(nn.Module):
         return torch.cat(last, 0), _cat_states(states), pos
 
     def think(self, h: Tensor, state, pos: Tensor, n_latent: int):
-        """Feed the last hidden state back as input for n_latent recurrent steps."""
+        """Feed the last hidden state back as input for n_latent recurrent steps
+        (or the <pause> embedding / nothing, for the ablations)."""
+        n_latent = self.slots(n_latent)
         for _ in range(n_latent):
-            h, state, _ = self.model.trunk(
-                self.thought_input(h), state, offset=pos, mode="recurrent"
-            )
+            if self.thought_mode == "pause":
+                x = self.model.embed.weight[self.pause_id].expand(h.shape[0], 1, -1)
+            else:
+                x = self.thought_input(h)
+            h, state, _ = self.model.trunk(x, state, offset=pos, mode="recurrent")
             pos = pos + 1
         return h, state, pos
 

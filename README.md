@@ -168,5 +168,7 @@ Question: ...\nAnswer:<bot> [h1][h2]...[hn] <eot> remaining steps\n#### 42
 - **Curriculum:** stage 0 is step-by-step fine-tuning (the explicit chain-of-thought baseline). At stage `s` the first `s` reasoning steps are replaced by `s × c` thoughts, and the optimizer is reset. Gradients flow back through every thought.
 - **Thought input:** `scale · norm_f(h)`, with a learned scalar initialized to the norm of real token embeddings.
 - **Evaluation:** `scripts/eval_latent.py` sweeps the number of thoughts at test time (accuracy vs. thinking length).
+- **Ablations (`--thought_mode`):** `pause` gives every thought slot the same learned `<pause>` embedding (extra compute, no fed-back state); `none` drops the slots entirely (removed steps, straight to the answer). Latent reasoning is only working if `latent` beats both at the same stage, and if accuracy rises with the number of thoughts.
+- **Rented GPU:** `scripts/cloud_latent.sh` runs all three modes plus the sweeps on one box (e.g. a Vast.ai RTX 5090) and resumes after interruptions.
 - **Tests:** with zero thoughts the latent path matches an ordinary forward pass exactly; batched thoughts match per-example ones; a two-stage run stopped mid-stage resumes and finishes.
 - **Colab:** `colab/retnet_300m_latent.ipynb`.

@@ -20,7 +20,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from retnet.checkpoint import load_latest_checkpoint, load_run  # noqa: E402
-from retnet.latent import LatentReasoner  # noqa: E402
+from retnet.latent import PAUSE, LatentReasoner  # noqa: E402
 from train_latent import evaluate  # noqa: E402
 
 
@@ -39,18 +39,20 @@ def main() -> None:
     ck, _ = load_latest_checkpoint(a.run, "cpu")
     lat = ck.get("latent", {}) if ck else {}
     del ck
-    reasoner = LatentReasoner(model, lat.get("scale", 1.0)).to(a.device).eval()
-    trained = int(lat.get("stage", 0)) * int(lat.get("c", 0))
+    mode = lat.get("thought_mode", "latent")
+    reasoner = LatentReasoner(model, lat.get("scale", 1.0), mode,
+                              tok.token_to_id(PAUSE)).to(a.device).eval()
+    trained = int(lat.get("n_latent", int(lat.get("stage", 0)) * int(lat.get("c", 0))))
     sweep = [int(x) for x in a.n_latent.split(",") if x.strip()] or [trained]
     print(f"{a.run} step {step}: trained with {trained} thoughts (stage {lat.get('stage')}, "
-          f"c {lat.get('c')}), scale {float(reasoner.scale):.3f}")
+          f"c {lat.get('c')}, mode {mode}), scale {float(reasoner.scale):.3f}")
 
     from datasets import load_dataset
     from retnet.latent import parse_gsm8k
 
     test = [p for r in load_dataset("openai/gsm8k", "main", split="test")
             if (p := parse_gsm8k(r["question"], r["answer"]))]
-    results = {"run": str(a.run), "step": step, "trained_n_latent": trained,
+    results = {"run": str(a.run), "step": step, "trained_n_latent": trained, "thought_mode": mode,
                "calculator": not a.no_calculator, "sweep": []}
     for n in sweep:
         t0 = time.time()

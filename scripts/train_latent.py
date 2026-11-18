@@ -36,6 +36,8 @@ from retnet.latent import (  # noqa: E402
     answer_of,
     parse_gsm8k,
     parse_metamath,
+    PAUSE,
+    THOUGHT_MODES,
     special_ids,
 )
 
@@ -95,7 +97,8 @@ def evaluate(reasoner, tok, test, n_latent, limit, batch, use_calculator=True, s
     acc = correct / max(1, n)
     reasoner.train()
     return {"acc": acc, "stderr": (acc * (1 - acc) / max(1, n)) ** 0.5, "n": n,
-            "n_latent": n_latent, "calculator_calls_per_problem": calls / max(1, n)}
+            "n_latent": reasoner.slots(n_latent), "thought_mode": reasoner.thought_mode,
+            "calculator_calls_per_problem": calls / max(1, n)}
 
 
 def main() -> None:
@@ -106,6 +109,8 @@ def main() -> None:
     ap.add_argument("--c", type=int, default=2, help="latent thoughts per replaced step")
     ap.add_argument("--epochs_stage0", type=int, default=3)
     ap.add_argument("--epochs_per_stage", type=int, default=2)
+    ap.add_argument("--thought_mode", default="latent", choices=THOUGHT_MODES,
+                    help="latent = fed-back hidden state; pause/none = ablations")
     ap.add_argument("--metamath", type=int, default=0, help="extra MetaMathQA GSM problems")
     ap.add_argument("--max_suffix_tokens", type=int, default=384)
     ap.add_argument("--batch_size", type=int, default=16)
@@ -134,7 +139,9 @@ def main() -> None:
     ids = special_ids(tok)
     if not (out / "tokenizer.json").is_file():
         shutil.copyfile(a.init / "tokenizer.json", out / "tokenizer.json")
-    reasoner = LatentReasoner(model).to(a.device).train()
+    reasoner = LatentReasoner(model, thought_mode=a.thought_mode,
+                              pause_id=tok.token_to_id(PAUSE)).to(a.device).train()
+    print(f"thought mode: {a.thought_mode}")
 
     train, test = load_problems(a)
     train = [p for p in train if len(encode(tok, p, 0, ids).suffix) <= a.max_suffix_tokens]
@@ -145,6 +152,9 @@ def main() -> None:
     if a.resume:
         ck, ck_path = load_latest_checkpoint(out, a.device)
     if ck is not None and "latent" in ck:
+        if ck["latent"].get("thought_mode", "latent") != a.thought_mode:
+            sys.exit(f"error: {out} was trained with --thought_mode "
+                     f"{ck['latent'].get('thought_mode')}; use another --out")
         model.load_state_dict(ck["model"])
         reasoner.scale.data.fill_(ck["latent"]["scale"])
         pos, step = dict(ck["latent"]["pos"]), int(ck["step"])
@@ -182,7 +192,8 @@ def main() -> None:
             "model": model.state_dict(), "config": model.cfg.to_dict(), "step": step,
             "optimizer": opt.state_dict(), "scaler": scaler.state_dict(),
             "latent": {"scale": float(reasoner.scale), "c": a.c, "pos": dict(pos),
-                       "stage": stage, "n_latent": stage * a.c,
+                       "stage": stage, "n_latent": reasoner.slots(stage * a.c),
+                       "thought_mode": a.thought_mode,
                        "stage_step": stage_step},
         }, out, keep_ckpts=a.keep_ckpts)
 
@@ -199,7 +210,8 @@ def main() -> None:
             if scaler.is_enabled() and ck.get("scaler"):
                 scaler.load_state_dict(ck["scaler"])
             stage_step = int(ck["latent"].get("stage_step", 0))
-        print(f"\n===== stage {stage}: first {stage} steps -> {n_latent} thoughts, {epochs} epoch(s)",
+        print(f"\n===== stage {stage}: first {stage} steps -> {reasoner.slots(n_latent)} "
+              f"{a.thought_mode} thoughts, {epochs} epoch(s)",
               flush=True)
         for epoch in range(pos["epoch"] if stage == pos["stage"] else 0, epochs):
             order = list(range(len(train)))
