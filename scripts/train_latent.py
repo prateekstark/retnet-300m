@@ -28,7 +28,7 @@ from pathlib import Path
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from retnet.checkpoint import load_latest_checkpoint, load_run, save_checkpoint  # noqa: E402
+from retnet.checkpoint import load_latest_checkpoint, load_run, resolve_run, save_checkpoint  # noqa: E402
 from retnet.latent import (  # noqa: E402
     LatentReasoner,
     encode,
@@ -103,7 +103,7 @@ def evaluate(reasoner, tok, test, n_latent, limit, batch, use_calculator=True, s
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--init", type=Path, required=True, help="pretrained run dir")
+    ap.add_argument("--init", required=True, help="pretrained run dir, or hf://user/repo")
     ap.add_argument("--out", type=Path, required=True, help="latent run dir")
     ap.add_argument("--max_stage", type=int, default=4, help="last stage (steps replaced)")
     ap.add_argument("--c", type=int, default=2, help="latent thoughts per replaced step")
@@ -135,6 +135,7 @@ def main() -> None:
 
     out = a.out
     out.mkdir(parents=True, exist_ok=True)
+    a.init = resolve_run(a.init)
     model, tok, base_step = load_run(a.init, a.device)
     ids = special_ids(tok)
     if not (out / "tokenizer.json").is_file():

@@ -290,27 +290,61 @@ def load_latest_checkpoint(
     )
 
 
-def load_run(run: Path, device: str, data: Path | None = None):
-    """Return (model in eval mode, tokenizer, step) from the latest valid checkpoint."""
+def resolve_run(run) -> Path:
+    """A local run dir, or `hf://user/repo[@revision]` downloaded from the
+    Hugging Face Hub (cached; needs `huggingface_hub`)."""
+    s = str(run)
+    for prefix in ("hf://", "hf:/"):
+        if s.startswith(prefix):
+            from huggingface_hub import snapshot_download
+
+            repo, _, rev = s[len(prefix):].partition("@")
+            return Path(snapshot_download(repo, revision=rev or None))
+    return Path(run)
+
+
+def load_exported(run: Path, device: str):
+    """(model, step) from an exported `model.safetensors` + `config.json`."""
+    from safetensors.torch import load_file
+
+    meta = json.loads((run / "config.json").read_text())
+    model = RetNetLM(RetNetConfig(**meta["model"]))
+    sd = {k: v.float() for k, v in load_file(str(run / "model.safetensors")).items()}
+    missing, unexpected = model.load_state_dict(sd, strict=False)
+    if unexpected or [k for k in missing if k != "lm_head.weight"]:
+        raise RuntimeError(f"weights do not match config: missing {missing}, unexpected {unexpected}")
+    return model.to(device).eval(), int(meta.get("step", 0))
+
+
+def load_run(run, device: str, data: Path | None = None):
+    """Return (model in eval mode, tokenizer, step) from the latest valid
+    checkpoint, an exported `model.safetensors`, or `hf://user/repo`."""
     from tokenizers import Tokenizer
 
-    run = Path(run)
+    run = resolve_run(run)
     tok_path = run / "tokenizer.json"
     if not tok_path.is_file() and data is not None:
         tok_path = Path(data) / "tokenizer.json"
     if not tok_path.is_file():
         sys.exit(f"error: missing tokenizer at {tok_path}")
 
-    ck, ck_path = load_latest_checkpoint(run, device)
-    if ck is None or ck_path is None:
-        sys.exit(f"error: no checkpoint found in {run}")
-    try:
-        model = RetNetLM(RetNetConfig(**ck["config"])).to(device).eval()
-        model.load_state_dict(ck["model"])
-    except Exception as e:
-        sys.exit(f"error: could not build model from {ck_path}: {e!r}")
+    if not checkpoint_candidates(run) and (run / "model.safetensors").is_file():
+        try:
+            model, step = load_exported(run, device)
+        except Exception as e:
+            sys.exit(f"error: could not load {run / 'model.safetensors'}: {e!r}")
+    else:
+        ck, ck_path = load_latest_checkpoint(run, device)
+        if ck is None or ck_path is None:
+            sys.exit(f"error: no checkpoint found in {run}")
+        try:
+            model = RetNetLM(RetNetConfig(**ck["config"])).to(device).eval()
+            model.load_state_dict(ck["model"])
+        except Exception as e:
+            sys.exit(f"error: could not build model from {ck_path}: {e!r}")
+        step = int(ck.get("step", 0))
     try:
         tok = Tokenizer.from_file(str(tok_path))
     except Exception as e:
         sys.exit(f"error: could not load tokenizer {tok_path}: {e!r}")
-    return model, tok, int(ck.get("step", 0))
+    return model, tok, step

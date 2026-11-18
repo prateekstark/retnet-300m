@@ -277,3 +277,46 @@ def test_end_to_end_multi_account_train_resume_and_chat(tmp_path: Path):
     assert res_chat.returncode == 0, res_chat.stdout + res_chat.stderr
     assert "step 4" in res_chat.stdout
 
+
+
+def test_export_safetensors_and_hf_resolve(tmp_path: Path, monkeypatch):
+    """export_hf.py writes weights-only safetensors that load_run reads back
+    (tied head restored), and hf://user/repo resolves through the Hub cache."""
+    import subprocess
+    import sys
+
+    from tokenizers import Tokenizer, models
+
+    import retnet.checkpoint as rc
+    from retnet.checkpoint import load_run
+
+    model, _, cfg, obj = _dummy_state(42)
+    run = tmp_path / "run"
+    run.mkdir()
+    save_checkpoint(obj, run, prune_min_age_s=0)
+    Tokenizer(models.BPE()).save(str(run / "tokenizer.json"))
+    out = tmp_path / "export"
+    root = Path(__file__).resolve().parents[1]
+    subprocess.run([sys.executable, str(root / "scripts" / "export_hf.py"), "--run", str(run),
+                    "--out", str(out), "--dtype", "fp32"], check=True, capture_output=True)
+    assert {p.name for p in out.iterdir()} == {"model.safetensors", "config.json", "tokenizer.json", "README.md"}
+    m2, _, step = load_run(out, "cpu")
+    assert step == 42
+    for k, v in model.state_dict().items():
+        assert torch.equal(v, m2.state_dict()[k]), k
+    if cfg.tie_embeddings:
+        assert m2.lm_head.weight.data_ptr() == m2.embed.weight.data_ptr()
+
+    calls = []
+
+    def fake_download(repo, revision=None):
+        calls.append((repo, revision))
+        return str(out)
+
+    import huggingface_hub
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", fake_download)
+    assert rc.resolve_run("hf://me/retnet@v1") == out
+    assert rc.resolve_run(Path("hf://me/retnet")) == out  # Path() collapses '//' to '/'
+    assert calls == [("me/retnet", "v1"), ("me/retnet", None)]
+    assert rc.resolve_run(run) == run
