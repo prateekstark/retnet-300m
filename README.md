@@ -30,6 +30,17 @@ Zero-shot, greedy decoding, first 256 GSM8K test problems:
 
 The calculator gives about 1.6× more correct answers. In the samples, the model usually sets the problem up right but gets the arithmetic wrong (`168 - 150 = 42`); the calculator fills in the exact result. For scale: GPT-2 Medium (355M, ~30B tokens) and Pythia-410M (300B tokens) score about 1–2% on GSM8K.
 
+Code and out-of-domain tasks (zero-shot):
+
+| Task | Score | Note |
+|---|---|---|
+| MBPP (257 test problems) | 0.4% pass@1, 41% syntactically valid | before any instruction tuning |
+| ARC-easy (500) | 37.8% | chance 25%; little encyclopedic text in the data mix |
+| ARC-challenge (500) | 21.2% (normalized) | at chance, as for most models this size |
+| HellaSwag (500) | 36.2% (normalized) | chance 25% |
+
+ARC and HellaSwag mostly measure general knowledge, which the code/math/textbook mix and the 0.5B-token budget do not target; they are reported for comparison with other small models.
+
 ## Resource constraints and how the design handles them
 
 | Constraint | Effect | How the project handles it |
