@@ -21,6 +21,9 @@ C=${C:-2}
 METAMATH=${METAMATH:-0}
 INIT=${INIT:-hf://starkprateek1/retnet-300m}   # or a local run dir
 PY=${PY:-python}
+BATCH=${BATCH:-8}     # 8 x 4 = 32 problems per step; 32 x 1 runs out of memory on 32 GB
+ACCUM=${ACCUM:-4}
+export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 
 $PY - <<'PY'
 import sys, torch
@@ -49,7 +52,7 @@ for MODE in $MODES; do
     OUT=runs/retnet-300m-$MODE
     echo "==================== thought mode: $MODE -> $OUT"
     $PY -u scripts/train_latent.py --init "$INIT" --out "$OUT" --thought_mode "$MODE" \
-        --max_stage "$MAX_STAGE" --c "$C" --metamath "$METAMATH" --batch_size 32 --grad_accum 1 \
+        --max_stage "$MAX_STAGE" --c "$C" --metamath "$METAMATH" --batch_size "$BATCH" --grad_accum "$ACCUM" \
         --resume 2>&1 | tee -a "$OUT.train.log"
     if [ ! -f "$OUT/eval_latent.json" ]; then
         $PY -u scripts/eval_latent.py --run "$OUT" \
