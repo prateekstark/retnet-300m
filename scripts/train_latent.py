@@ -225,7 +225,7 @@ def main() -> None:
                 with amp():
                     loss = reasoner.loss(batch, n_latent, a.chunk_size)
                 scaler.scale(loss / G).backward()
-                run_loss += float(loss)
+                run_loss += float(loss.detach())
                 tokens += sum(len(b.suffix) for b in batch)
                 if (bi + 1) % G:
                     continue

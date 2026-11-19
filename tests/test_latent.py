@@ -175,3 +175,40 @@ def test_train_latent_end_to_end_resume(tmp_path, monkeypatch, tok, mode):
     ck = torch.load(sorted(out.glob("ckpt_step_*.pt"))[-1], weights_only=False)
     assert ck["latent"]["thought_mode"] == mode
     assert ck["latent"]["stage"] == 1 and ck["latent"]["pos"]["stage"] == 2 and ck["latent"]["c"] == 2 and ck["step"] == 20
+
+
+@pytest.mark.parametrize("memory,short_conv", [("delta", 4), ("delta", 0), ("none", 4)])
+def test_left_padded_prefill_matches_per_sequence(memory, short_conv):
+    """One left-padded batched prefill must give each prompt exactly the state
+    and next-token logits of prefilling it alone (and continue identically)."""
+    from retnet.calculator import prefill_batch
+
+    torch.manual_seed(7)
+    cfg = RetNetConfig(vocab_size=50, d_model=32, n_layers=2, n_heads=2, memory=memory,
+                       short_conv=short_conv)
+    m = RetNetLM(cfg).double().eval()
+    prompts = [list(torch.randint(1, 50, (n,)).tolist()) for n in (3, 11, 7, 20)]
+    state, logits, pos = prefill_batch(m, prompts, chunk_size=4)
+    nxt = torch.tensor([[5], [6], [7], [8]])
+    lg2, _, _ = m(nxt, state=state, offset=pos, mode="recurrent")
+    for i, p in enumerate(prompts):
+        lg, _, st = m(torch.tensor([p]), mode="chunkwise", chunk_size=4)
+        assert torch.allclose(logits[i], lg[0, -1], atol=1e-10), i
+        lg_alone, _, _ = m(nxt[i:i + 1], state=st, offset=len(p), mode="recurrent")
+        assert torch.allclose(lg2[i], lg_alone[0], atol=1e-10), i
+
+
+def test_batched_latent_loss_varied_lengths(tok):
+    """Prefixes of different lengths: batched loss == token-weighted per-example loss."""
+    m = _model(tok, seed=8)
+    r = LatentReasoner(m, scale=0.6)
+    ids = special_ids(tok)
+    probs = [Problem("Hi?", ("1 + 1 = <<1+1=2>>2",), "2"),
+             Problem("Tom has 12 apples and 30 pears and buys 7 more apples. How many apples?",
+                     ("12 + 7 = <<12+7=19>>19",), "19")]
+    batch = [encode(tok, p, 0, ids) for p in probs]
+    assert len(batch[0].prefix) != len(batch[1].prefix)
+    together = r.loss(batch, 3, 8)
+    n = [len(b.suffix) - 1 for b in batch]
+    alone = sum(r.loss([b], 3, 8) * k for b, k in zip(batch, n)) / sum(n)
+    assert torch.allclose(together, alone, atol=1e-9)

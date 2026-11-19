@@ -169,18 +169,27 @@ def generate_batch_greedy(
 
 
 @torch.no_grad()
-def prefill_batch(model, prompts_ids: list[list[int]]):
-    """Prefill each prompt separately (different lengths), then stack.
+def left_pad(prompts_ids: list[list[int]], device, pad_id: int = 0):
+    """(ids (B, T), mask (B, T)) with every prompt right-aligned at column T-1."""
+    T = max(len(p) for p in prompts_ids)
+    ids = torch.full((len(prompts_ids), T), pad_id, dtype=torch.long, device=device)
+    mask = torch.zeros(len(prompts_ids), T, dtype=torch.bool, device=device)
+    for i, p in enumerate(prompts_ids):
+        ids[i, T - len(p):] = torch.tensor(p, device=device)
+        mask[i, T - len(p):] = True
+    return ids, mask
+
+
+@torch.no_grad()
+def prefill_batch(model, prompts_ids: list[list[int]], chunk_size: int = 256):
+    """Prefill prompts of different lengths in one left-padded call.
 
     Returns (state, next_logits (B, V), positions (B,))."""
     device = next(model.parameters()).device
-    states, first, pos = [], [], []
-    for ids in prompts_ids:
-        lg, _, st = model(torch.tensor([ids], device=device), mode="chunkwise", chunk_size=256)
-        states.append(st)
-        first.append(lg[0, -1])
-        pos.append(len(ids))
-    return _cat_states(states), torch.stack(first), torch.tensor(pos, device=device)
+    ids, mask = left_pad(prompts_ids, device)
+    lg, _, state = model(ids, mode="chunkwise", chunk_size=chunk_size, return_state=True, mask=mask)
+    pos = torch.full((len(prompts_ids),), ids.shape[1], device=device)
+    return state, lg[:, -1], pos
 
 
 @torch.no_grad()

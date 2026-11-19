@@ -257,13 +257,29 @@ class MultiScaleRetention(nn.Module):
         mode: str = "parallel",
         chunk_size: int = 64,
         return_state: bool = False,
+        mask: Tensor | None = None,
     ) -> tuple[Tensor, Tensor | None]:
-        """x: (B, T, d_model). ``offset`` is the absolute position of x[:, 0]."""
+        """x: (B, T, d_model). ``offset`` is the absolute position of x[:, 0].
+
+        ``mask`` (B, T), 1 for real tokens and 0 for left padding: padded
+        positions write nothing to the state and feed zeros to the short conv,
+        so a left-padded sequence gives the same state and outputs (at real
+        positions) as the unpadded one. Retention and RoPE only depend on
+        relative positions, so the shift from padding does not matter.
+        """
         if mode not in self.MODES:
             raise ValueError(f"mode must be one of {self.MODES}, got {mode!r}")
         S, cache = state if isinstance(state, tuple) else (state, None)
+        if mask is not None:
+            m = mask.to(x.dtype)
+            x = x * m[..., None]
         mixed, new_cache = self._mix(x, cache)
         q, k, v, beta = self._project(x, offset, mixed)
+        if mask is not None:
+            mh = m[:, None, :, None]  # (B, 1, T, 1)
+            k, v = k * mh, v * mh
+            if beta is not None:
+                beta = beta * m[:, None, :]
         state = S
 
         # Run the retention core in fp32 so decayed sums and the triangular

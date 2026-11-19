@@ -37,7 +37,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from .calculator import _cat_states, annotate_arithmetic, decode_batch_greedy
+from .calculator import annotate_arithmetic, decode_batch_greedy, left_pad
 
 BOT = "<|reserved_0|>"  # begin latent thought
 EOT = "<|reserved_1|>"  # end latent thought
@@ -167,19 +167,16 @@ class LatentReasoner(nn.Module):
         return (self.scale * self.model.norm_f(h)).to(h.dtype)
 
     def prefill(self, prefixes: list[list[int]], chunk_size: int = 128):
-        """Each prefix on its own (lengths differ), states stacked.
+        """All prefixes in one left-padded call (see MultiScaleRetention mask).
 
         Returns (last hidden (B,1,d), state, positions (B,))."""
         m = self.model
         dev = m.embed.weight.device
-        states, last = [], []
-        for ids in prefixes:
-            x = m.embed(torch.tensor([ids], device=dev))
-            h, st, _ = m.trunk(x, mode="chunkwise", chunk_size=chunk_size, return_state=True)
-            states.append(st)
-            last.append(h[:, -1:])
-        pos = torch.tensor([len(p) for p in prefixes], device=dev)
-        return torch.cat(last, 0), _cat_states(states), pos
+        ids, mask = left_pad(prefixes, dev)
+        h, state, _ = m.trunk(m.embed(ids), mode="chunkwise", chunk_size=chunk_size,
+                              return_state=True, mask=mask)
+        pos = torch.full((len(prefixes),), ids.shape[1], device=dev)
+        return h[:, -1:], state, pos
 
     def think(self, h: Tensor, state, pos: Tensor, n_latent: int):
         """Feed the last hidden state back as input for n_latent recurrent steps

@@ -89,9 +89,9 @@ class RetNetBlock(nn.Module):
         self.ffn = FeedForward(cfg.d_model, cfg.ffn_mult * cfg.d_model, cfg.dropout)
         self.dropout = nn.Dropout(cfg.dropout)
 
-    def forward(self, x, state, offset, mode, chunk_size, return_state):
+    def forward(self, x, state, offset, mode, chunk_size, return_state, mask=None):
         y, new_state = self.retention(
-            self.norm1(x), state, offset, mode, chunk_size, return_state
+            self.norm1(x), state, offset, mode, chunk_size, return_state, mask
         )
         x = x + self.dropout(y)
         x = x + self.ffn(self.norm2(x))
@@ -144,10 +144,11 @@ class RetNetLM(nn.Module):
         mode: str = "parallel",
         chunk_size: int = 64,
         return_state: bool = False,
+        mask: Tensor | None = None,
     ) -> tuple[Tensor, Tensor | None, State | None]:
-        """Returns (logits, loss, new_state)."""
+        """Returns (logits, loss, new_state). ``mask``: see ``trunk``."""
         x, new_states, keep_state = self.trunk(
-            self.embed(input_ids), state, offset, mode, chunk_size, return_state
+            self.embed(input_ids), state, offset, mode, chunk_size, return_state, mask
         )
         logits = self.lm_head(self.norm_f(x))
 
@@ -166,8 +167,12 @@ class RetNetLM(nn.Module):
         mode: str = "parallel",
         chunk_size: int = 64,
         return_state: bool = False,
+        mask: Tensor | None = None,
     ) -> tuple[Tensor, list, bool]:
         """Run the block stack on input embeddings x (B, T, d_model).
+
+        ``mask`` (B, T) marks real tokens (1) vs left padding (0), so prompts
+        of different lengths can be prefilled in one call.
 
         Returns (hidden before norm_f, per-layer states, whether the states are
         valid). Latent reasoning feeds hidden states back in through this.
@@ -184,13 +189,13 @@ class RetNetLM(nn.Module):
         for block, s in zip(self.blocks, states):
             if use_ckpt:
                 x = grad_checkpoint(
-                    lambda h, b=block: b(h, None, offset, mode, chunk_size, False)[0],
+                    lambda h, b=block: b(h, None, offset, mode, chunk_size, False, mask)[0],
                     x,
                     use_reentrant=False,
                 )
                 ns = None
             else:
-                x, ns = block(x, s, offset, mode, chunk_size, return_state)
+                x, ns = block(x, s, offset, mode, chunk_size, return_state, mask)
             new_states.append(ns)
         keep_state = (return_state or mode != "parallel") and not use_ckpt
         return x, new_states, keep_state
