@@ -33,7 +33,7 @@ if arch not in torch.cuda.get_arch_list():
              "use a PyTorch image built for CUDA 12.8+ (pip install torch --index-url "
              "https://download.pytorch.org/whl/cu128)")
 PY
-$PY -m pip -q install tokenizers datasets huggingface_hub safetensors
+$PY -m pip -q install tokenizers datasets huggingface_hub safetensors pytest
 # Fetch (and cache) the pretrained weights now, so a bad INIT fails before training.
 $PY - "$INIT" <<'PY'
 import sys
