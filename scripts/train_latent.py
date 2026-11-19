@@ -278,6 +278,7 @@ def main() -> None:
                     save(stage, stage_step, opt)
                     print(f"stopping at --max_steps {a.max_steps}")
                     return
+            opt.zero_grad(set_to_none=True)  # drop a partial accumulation group at epoch end
             pos.update(stage=stage, epoch=epoch + 1, batch=0)
         res = evaluate(reasoner, tok, test, n_latent, a.eval_limit, a.eval_batch)
         print(f"stage {stage} GSM8K ({res['n']}): acc {res['acc']:.3f} +/- {res['stderr']:.3f} "
