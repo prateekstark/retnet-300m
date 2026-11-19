@@ -91,6 +91,29 @@ def load_problems(a) -> tuple[list, list]:
     return train, test
 
 
+def token_batches(order, lengths, max_tokens, n_latent, max_batch, rng, pool=64):
+    """Batches of similar-length problems with (count x longest) <= max_tokens.
+
+    Sorts within pools of `pool * max_batch` shuffled problems, so batches stay
+    random across the epoch, then shuffles the batch order."""
+    batches = []
+    span = pool * max_batch
+    for lo in range(0, len(order), span):
+        chunk = sorted(order[lo: lo + span], key=lambda i: lengths[i])
+        cur, longest = [], 0
+        for i in chunk:
+            L = lengths[i] + n_latent
+            if cur and (len(cur) >= max_batch or (len(cur) + 1) * max(longest, L) > max_tokens):
+                batches.append(cur)
+                cur, longest = [], 0
+            cur.append(i)
+            longest = max(longest, L)
+        if cur:
+            batches.append(cur)
+    rng.shuffle(batches)
+    return batches
+
+
 def evaluate(reasoner, tok, test, n_latent, limit, batch, use_calculator=True, show=2) -> dict:
     reasoner.eval()
     probs = test[: limit or len(test)]
@@ -129,6 +152,10 @@ def main() -> None:
     ap.add_argument("--aug_limit", type=int, default=0, help="use only this many GSM8K-Aug problems")
     ap.add_argument("--metamath", type=int, default=0, help="extra MetaMathQA GSM problems")
     ap.add_argument("--max_suffix_tokens", type=int, default=384)
+    ap.add_argument("--max_prefix_tokens", type=int, default=0, help="drop longer questions (0 = keep all)")
+    ap.add_argument("--max_tokens", type=int, default=0,
+                    help="token budget per batch (problems x longest problem); groups problems of "
+                         "similar length so memory stays flat. 0 = fixed --batch_size")
     ap.add_argument("--batch_size", type=int, default=16)
     ap.add_argument("--grad_accum", type=int, default=2)
     ap.add_argument("--lr", type=float, default=1e-4)
@@ -165,7 +192,17 @@ def main() -> None:
     print(f"thought mode: {a.thought_mode}")
 
     train, test = load_problems(a)
-    train = [p for p in train if len(encode(tok, p, 0, ids).suffix) <= a.max_suffix_tokens]
+    lengths = []
+    kept = []
+    for p in train:
+        e = encode(tok, p, 0, ids)
+        if len(e.suffix) <= a.max_suffix_tokens and (not a.max_prefix_tokens
+                                                      or len(e.prefix) <= a.max_prefix_tokens):
+            kept.append(p)
+            lengths.append(len(e.prefix) + len(e.suffix))
+    if len(kept) < len(train):
+        print(f"dropped {len(train) - len(kept)} problems over the length caps", flush=True)
+    train = kept
 
     # ---- resume -------------------------------------------------------------
     pos = {"stage": 0, "epoch": 0, "batch": 0}
@@ -239,9 +276,13 @@ def main() -> None:
               f"{a.thought_mode} thoughts, {epochs} epoch(s)",
               flush=True)
         for epoch in range(pos["epoch"] if stage == pos["stage"] else 0, epochs):
+            rng = random.Random(a.seed * 1000 + stage * 100 + epoch)
             order = list(range(len(train)))
-            random.Random(a.seed * 1000 + stage * 100 + epoch).shuffle(order)
-            batches = [order[i: i + B] for i in range(0, len(order) - B + 1, B)]
+            rng.shuffle(order)
+            if a.max_tokens:
+                batches = token_batches(order, lengths, a.max_tokens, n_latent, B, rng)
+            else:
+                batches = [order[i: i + B] for i in range(0, len(order) - B + 1, B)]
             start = pos["batch"] if (stage == pos["stage"] and epoch == pos["epoch"]) else 0
             t0, tokens, run_loss = time.time(), 0, 0.0
             for bi in range(start, len(batches)):

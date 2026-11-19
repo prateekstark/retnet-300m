@@ -234,3 +234,19 @@ def test_parse_gsm8k_aug():
     assert suffix_text(p, 1) == " <<600-180=420>>420\n#### 420"
     assert parse_gsm8k_aug("Q?", ["six times two"], "12") is None
     assert parse_gsm8k_aug("Q?", ["<<1+1=2>>"], "two") is None
+
+
+def test_token_batches_cover_all_within_budget():
+    import random
+
+    import train_latent as tl
+
+    rng = random.Random(0)
+    lengths = [rng.randint(20, 250) for _ in range(1000)]
+    order = list(range(1000))
+    rng.shuffle(order)
+    batches = tl.token_batches(order, lengths, max_tokens=1000, n_latent=6, max_batch=32, rng=rng)
+    assert sorted(i for b in batches for i in b) == list(range(1000))
+    for b in batches:
+        assert len(b) <= 32
+        assert len(b) == 1 or len(b) * max(lengths[i] + 6 for i in b) <= 1000

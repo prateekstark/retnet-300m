@@ -26,8 +26,9 @@ EPOCHS0=${EPOCHS0:-1}          # stage 0 (explicit step-by-step) epochs
 EPOCHS=${EPOCHS:-1}            # epochs per latent stage
 INIT=${INIT:-hf://starkprateek1/retnet-300m}   # or a local run dir
 PY=${PY:-python}
-BATCH=${BATCH:-8}     # 8 x 4 = 32 problems per step; 32 x 1 runs out of memory on 32 GB
-ACCUM=${ACCUM:-4}
+BATCH=${BATCH:-64}    # max problems per batch; MAX_TOKENS sets the real size
+MAX_TOKENS=${MAX_TOKENS:-3000}  # problems x longest problem per batch (~30 typical GSM8K-Aug problems); 3400 peaked at 27.6 of 32 GB
+ACCUM=${ACCUM:-1}
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 
 $PY - <<'PY'
@@ -57,7 +58,7 @@ for MODE in $MODES; do
     OUT=runs/retnet-300m-$MODE
     echo "==================== thought mode: $MODE -> $OUT"
     $PY -u scripts/train_latent.py --init "$INIT" --out "$OUT" --thought_mode "$MODE" \
-        --max_stage "$MAX_STAGE" --c "$C" --metamath "$METAMATH" --data "$DATA" --aug_limit "$AUG_LIMIT" $([ "$COMPILE" = 1 ] && echo --compile) --epochs_stage0 "$EPOCHS0" --epochs_per_stage "$EPOCHS" --batch_size "$BATCH" --grad_accum "$ACCUM" \
+        --max_stage "$MAX_STAGE" --c "$C" --metamath "$METAMATH" --data "$DATA" --aug_limit "$AUG_LIMIT" $([ "$COMPILE" = 1 ] && echo --compile) --epochs_stage0 "$EPOCHS0" --epochs_per_stage "$EPOCHS" --batch_size "$BATCH" --grad_accum "$ACCUM" --max_tokens "$MAX_TOKENS" --max_prefix_tokens 128 --max_suffix_tokens 128 \
         --resume 2>&1 | tee -a "$OUT.train.log"
     if [ ! -f "$OUT/eval_latent.json" ]; then
         $PY -u scripts/eval_latent.py --run "$OUT" \
