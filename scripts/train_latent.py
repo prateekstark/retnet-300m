@@ -134,6 +134,8 @@ def main() -> None:
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--weight_decay", type=float, default=0.01)
     ap.add_argument("--warmup_steps", type=int, default=50)
+    ap.add_argument("--min_lr_ratio", type=float, default=0.1,
+                    help="cosine decay within each stage down to lr * this (1 = constant lr)")
     ap.add_argument("--grad_clip", type=float, default=1.0)
     ap.add_argument("--chunk_size", type=int, default=128)
     ap.add_argument("--eval_limit", type=int, default=256)
@@ -251,7 +253,10 @@ def main() -> None:
                 tokens += sum(len(b.suffix) for b in batch)
                 if (bi + 1) % G:
                     continue
-                lr = a.lr * min(1.0, (stage_step + 1) / a.warmup_steps)
+                total = max(1, epochs * (len(batches) // G))
+                prog = min(1.0, max(0.0, (stage_step - a.warmup_steps) / max(1, total - a.warmup_steps)))
+                cos = a.min_lr_ratio + (1 - a.min_lr_ratio) * 0.5 * (1 + math.cos(math.pi * prog))
+                lr = a.lr * min(1.0, (stage_step + 1) / a.warmup_steps) * cos
                 for g in opt.param_groups:
                     g["lr"] = lr
                 scaler.unscale_(opt)
