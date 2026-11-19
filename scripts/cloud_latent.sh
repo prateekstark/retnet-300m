@@ -16,8 +16,11 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 MODES=${MODES:-"latent pause none"}   # latent first: the result that matters
-MAX_STAGE=${MAX_STAGE:-4}
+MAX_STAGE=${MAX_STAGE:-3}     # GSM8K-Aug solutions have 2.6 steps on average
 C=${C:-2}
+DATA=${DATA:-gsm8k_aug}        # gsm8k_aug: 385k equation-step problems (Coconut setup); gsm8k: GSM8K (+ METAMATH)
+AUG_LIMIT=${AUG_LIMIT:-0}      # 0 = all GSM8K-Aug problems
+COMPILE=${COMPILE:-0}          # 1 = torch.compile the blocks (check scripts/bench_latent.py first)
 METAMATH=${METAMATH:-40000}   # extra GSM-style problems: 7.4k GSM8K alone is memorized in one epoch
 EPOCHS0=${EPOCHS0:-1}          # stage 0 (explicit step-by-step) epochs
 EPOCHS=${EPOCHS:-1}            # epochs per latent stage
@@ -54,7 +57,7 @@ for MODE in $MODES; do
     OUT=runs/retnet-300m-$MODE
     echo "==================== thought mode: $MODE -> $OUT"
     $PY -u scripts/train_latent.py --init "$INIT" --out "$OUT" --thought_mode "$MODE" \
-        --max_stage "$MAX_STAGE" --c "$C" --metamath "$METAMATH" --epochs_stage0 "$EPOCHS0" --epochs_per_stage "$EPOCHS" --batch_size "$BATCH" --grad_accum "$ACCUM" \
+        --max_stage "$MAX_STAGE" --c "$C" --metamath "$METAMATH" --data "$DATA" --aug_limit "$AUG_LIMIT" $([ "$COMPILE" = 1 ] && echo --compile) --epochs_stage0 "$EPOCHS0" --epochs_per_stage "$EPOCHS" --batch_size "$BATCH" --grad_accum "$ACCUM" \
         --resume 2>&1 | tee -a "$OUT.train.log"
     if [ ! -f "$OUT/eval_latent.json" ]; then
         $PY -u scripts/eval_latent.py --run "$OUT" \

@@ -91,6 +91,26 @@ def parse_metamath(query: str, response: str) -> Problem | None:
     return Problem(query.strip(), tuple(steps), final)
 
 
+_AUG_STEP = re.compile(r"^<<([^<>=]+)=([^<>=]+)>>$")
+
+
+def parse_gsm8k_aug(question: str, steps: list[str], answer: str) -> Problem | None:
+    """GSM8K-Aug rows (whynlp/gsm8k-aug, the Coconut / iCoT training set): each
+    step is a bare equation '<<600*30/100=180>>'. Written in our calculator
+    format '<<600*30/100=180>>180', so at test time the model writes the
+    expression and the calculator fills in the result."""
+    out = []
+    for st in steps:
+        m = _AUG_STEP.match(st.strip())
+        if not m:
+            return None
+        out.append(f"<<{m.group(1).strip()}={m.group(2).strip()}>>{m.group(2).strip()}")
+    final = str(answer).strip().replace(",", "")
+    if not out or not re.fullmatch(r"-?\d+(?:\.\d+)?", final):
+        return None
+    return Problem(question.strip(), tuple(out), final)
+
+
 def prompt_text(question: str) -> str:
     return f"Question: {question}\nAnswer:"
 

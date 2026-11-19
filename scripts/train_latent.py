@@ -35,6 +35,7 @@ from retnet.latent import (  # noqa: E402
     normalize_answer,
     answer_of,
     parse_gsm8k,
+    parse_gsm8k_aug,
     parse_metamath,
     PAUSE,
     THOUGHT_MODES,
@@ -55,6 +56,19 @@ def load_problems(a) -> tuple[list, list]:
     """(train problems, GSM8K test problems)."""
     from datasets import load_dataset
 
+    test = [p for r in load_dataset("openai/gsm8k", "main", split="test")
+            if (p := parse_gsm8k(r["question"], r["answer"]))]
+    if a.data == "gsm8k_aug":
+        test_q = {p.question for p in test}
+        rows = load_dataset("whynlp/gsm8k-aug", split="train")
+        train = [p for r in rows if r["question"].strip() not in test_q
+                 and (p := parse_gsm8k_aug(r["question"], r["steps"], r["answer"]))]
+        if a.aug_limit:
+            random.Random(a.seed).shuffle(train)
+            train = train[: a.aug_limit]
+        print(f"train problems: {len(train)} GSM8K-Aug (of {len(rows)}; equation steps), "
+              f"test: {len(test)}", flush=True)
+        return train, test
     train = [p for r in load_dataset("openai/gsm8k", "main", split="train")
              if (p := parse_gsm8k(r["question"], r["answer"]))]
     n_gsm = len(train)
@@ -72,8 +86,6 @@ def load_problems(a) -> tuple[list, list]:
             if len(extra) >= a.metamath:
                 break
         train += extra
-    test = [p for r in load_dataset("openai/gsm8k", "main", split="test")
-            if (p := parse_gsm8k(r["question"], r["answer"]))]
     print(f"train problems: {len(train)} ({n_gsm} GSM8K + {len(train) - n_gsm} MetaMathQA-GSM), "
           f"test: {len(test)}", flush=True)
     return train, test
@@ -111,6 +123,10 @@ def main() -> None:
     ap.add_argument("--epochs_per_stage", type=int, default=2)
     ap.add_argument("--thought_mode", default="latent", choices=THOUGHT_MODES,
                     help="latent = fed-back hidden state; pause/none = ablations")
+    ap.add_argument("--data", default="gsm8k", choices=["gsm8k", "gsm8k_aug"],
+                    help="gsm8k: GSM8K train (+ --metamath); gsm8k_aug: 385k equation-step "
+                         "problems (Coconut's training set)")
+    ap.add_argument("--aug_limit", type=int, default=0, help="use only this many GSM8K-Aug problems")
     ap.add_argument("--metamath", type=int, default=0, help="extra MetaMathQA GSM problems")
     ap.add_argument("--max_suffix_tokens", type=int, default=384)
     ap.add_argument("--batch_size", type=int, default=16)
@@ -126,6 +142,8 @@ def main() -> None:
     ap.add_argument("--save_every_minutes", type=float, default=15.0)
     ap.add_argument("--keep_ckpts", type=int, default=2)
     ap.add_argument("--max_steps", type=int, default=0, help="stop after this many optimizer steps (smoke tests)")
+    ap.add_argument("--compile", action="store_true",
+                    help="torch.compile each block (fewer kernel launches in the thought loop)")
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--dtype", default="auto", choices=["auto", "fp32", "bf16", "fp16"])
@@ -173,6 +191,10 @@ def main() -> None:
         (lambda: torch.autocast(device_type=dev_type, dtype=dtype))
     scaler = torch.amp.GradScaler(dev_type, enabled=dtype == torch.float16)
     print(f"precision: {str(dtype).replace('torch.', '')}, device {a.device}")
+    if a.compile:
+        for blk in model.blocks:
+            blk.compile(dynamic=True)
+        print("compiled blocks with torch.compile (first steps are slow while it compiles)")
 
     def new_optimizer():
         decay = [p for n, p in reasoner.named_parameters() if p.ndim >= 2]

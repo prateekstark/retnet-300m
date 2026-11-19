@@ -224,3 +224,13 @@ def test_generate_stop_rule_keeps_multi_digit_answers():
     assert re.search(stop, "x\n#### 1") is None
     assert re.search(stop, "x\n#### 18\n")
     assert answer_of("x\n#### 18\n") == "18"
+
+
+def test_parse_gsm8k_aug():
+    from retnet.latent import parse_gsm8k_aug, suffix_text
+
+    p = parse_gsm8k_aug(" Q? ", ["<<600*30/100=180>>", "<<600-180=420>>"], "420")
+    assert p.steps == ("<<600*30/100=180>>180", "<<600-180=420>>420") and p.answer == "420"
+    assert suffix_text(p, 1) == " <<600-180=420>>420\n#### 420"
+    assert parse_gsm8k_aug("Q?", ["six times two"], "12") is None
+    assert parse_gsm8k_aug("Q?", ["<<1+1=2>>"], "two") is None
