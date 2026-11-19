@@ -218,7 +218,7 @@ class LatentReasoner(nn.Module):
         n_latent: int,
         max_new_tokens: int = 256,
         use_calculator: bool = True,
-        stop_regex: str | None = r"####[^\n]*\d[^\n]*(\n|$)",
+        stop_regex: str | None = r"####[^\n]*\d[^\n]*\n",  # needs the newline: "$" would stop after the first digit
     ) -> list[tuple[str, int]]:
         """Think for n_latent steps, emit <eot>, then decode greedily with the calculator."""
         ids = special_ids(tok)

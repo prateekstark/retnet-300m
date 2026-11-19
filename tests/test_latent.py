@@ -212,3 +212,15 @@ def test_batched_latent_loss_varied_lengths(tok):
     n = [len(b.suffix) - 1 for b in batch]
     alone = sum(r.loss([b], 3, 8) * k for b, k in zip(batch, n)) / sum(n)
     assert torch.allclose(together, alone, atol=1e-9)
+
+
+def test_generate_stop_rule_keeps_multi_digit_answers():
+    """Regression: a stop rule ending in '$' stopped decoding at '#### 1' when
+    the answer was 18, so only single-digit answers could ever be correct."""
+    import inspect
+    import re
+
+    stop = inspect.signature(LatentReasoner.generate).parameters["stop_regex"].default
+    assert re.search(stop, "x\n#### 1") is None
+    assert re.search(stop, "x\n#### 18\n")
+    assert answer_of("x\n#### 18\n") == "18"
